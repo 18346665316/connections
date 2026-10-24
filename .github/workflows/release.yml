@@ -6,6 +6,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     name: Build Windows (x64)
@@ -31,7 +34,7 @@ jobs:
           path: dist/邻传-Windows-x64.zip
 
   build-macos:
-    name: Build macOS (Universal/ARM64)
+    name: Build macOS (ARM64)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +72,32 @@ jobs:
         run: flutter pub get
       - name: Build Android Release APK
         run: flutter build apk --release
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/邻传-Android.apk"
       - uses: actions/upload-artifact@v4
         with:
           name: Connections-Android-APK
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: dist/邻传-Android.apk
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-macos, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }}
+          name: "邻传 (Connections) ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }}"
+          body: |
+            ### 邻传 (Connections) 跨平台生产发行版
+            - **Windows (x64)**: `邻传-Windows-x64.zip`（解压后运行 `connections.exe`）
+            - **macOS (Apple Silicon)**: `邻传-macOS.dmg`
+            - **Android**: `邻传-Android.apk`
+          files: release-assets/*
