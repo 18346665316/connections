@@ -1,0 +1,75 @@
+name: Build Cross-Platform Releases
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.2'
+          channel: 'stable'
+      - name: Install dependencies
+        run: flutter pub get
+      - name: Build Windows Release
+        run: flutter build windows --release
+      - name: Package Windows Release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Compress-Archive -Path "build/windows/x64/runner/Release/*" -DestinationPath "dist/邻传-Windows-x64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Connections-Windows-x64
+          path: dist/邻传-Windows-x64.zip
+
+  build-macos:
+    name: Build macOS (Universal/ARM64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.2'
+          channel: 'stable'
+      - name: Install dependencies
+        run: flutter pub get
+      - name: Build macOS Release
+        run: flutter build macos --release
+      - name: Package macOS DMG
+        run: |
+          mkdir -p dist
+          hdiutil create -volname "邻传" -srcfolder "build/macos/Build/Products/Release/Connections.app" -ov -format UDZO "dist/邻传-macOS.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Connections-macOS
+          path: dist/邻传-macOS.dmg
+
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.2'
+          channel: 'stable'
+      - name: Install dependencies
+        run: flutter pub get
+      - name: Build Android Release APK
+        run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Connections-Android-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
