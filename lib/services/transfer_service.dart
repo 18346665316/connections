@@ -15,6 +15,7 @@ typedef IncomingRequestResolver = Future<bool> Function(TransferSession session)
 class _OutboundPullContext {
   final TransferSession session;
   final String peerId;
+  final bool isWebPeer;
   final String token;
   bool offerDelivered = false;
   final Completer<bool> decisionCompleter = Completer<bool>();
@@ -27,6 +28,7 @@ class _OutboundPullContext {
   _OutboundPullContext({
     required this.session,
     required this.peerId,
+    required this.isWebPeer,
     required this.token,
   });
 }
@@ -345,12 +347,13 @@ class TransferService extends ChangeNotifier {
     final peer = _resolveRemotePeer(map, remoteIp);
     discoveryService.registerPeer(peer);
 
-    // 检查是否有挂起发往该节点的反向拉取任务（用于穿透 Android 模拟器 10.0.2.16 等单向 NAT）
+    // 检查是否有挂起发往该节点的反向拉取任务（用于穿透 Android 模拟器 10.0.2.16 等单向 NAT 或 Web 浏览器投递）
     final pendingOffers = <Map<String, dynamic>>[];
     for (final ctx in _outboundPullSessions.values) {
-      if (ctx.peerId == peer.id &&
-          !ctx.offerDelivered &&
-          !_cancelledSessionIds.contains(ctx.session.sessionId)) {
+      final shouldDeliver = ctx.peerId == peer.id &&
+          !_cancelledSessionIds.contains(ctx.session.sessionId) &&
+          (!ctx.offerDelivered || ctx.isWebPeer);
+      if (shouldDeliver) {
         ctx.offerDelivered = true;
         pendingOffers.add({
           'sessionId': ctx.session.sessionId,
@@ -1045,16 +1048,18 @@ class TransferService extends ChangeNotifier {
     }
   }
 
-  /// 反向拉取发送模式：适用于目标节点处于单向 NAT（如 Android 模拟器 10.0.2.16）或防火墙阻止入站连接的场景
+  /// 反向拉取发送模式：适用于目标节点处于单向 NAT（如 Android 模拟器 10.0.2.16）、Web 浏览器或防火墙阻止入站连接的场景
   Future<TransferSession> _sendViaReversePull({
     required PeerDevice peer,
     required TransferSession session,
   }) async {
     final sessionId = session.sessionId;
     final token = _generateSecureToken();
+    final isWeb = peer.deviceType == DeviceType.web;
     final ctx = _OutboundPullContext(
       session: session,
       peerId: peer.id,
+      isWebPeer: isWeb,
       token: token,
     );
     _outboundPullSessions[sessionId] = ctx;
@@ -1082,9 +1087,15 @@ class TransferService extends ChangeNotifier {
         return session;
       }
 
-      if (session.files.isEmpty) {
+      if (session.files.isEmpty || isWeb) {
+        ctx.stopwatch.start();
+        session.transferredBytes = session.totalBytes;
         session.status = TransferStatus.completed;
-        TransferLogger.send('✅ 文本消息已通过反向通道送达 ${peer.alias} [$sessionId]');
+        TransferLogger.send(
+          isWeb
+              ? '✅ 已投递至网页端收件箱 ${peer.alias} [$sessionId]'
+              : '✅ 文本消息已通过反向通道送达 ${peer.alias} [$sessionId]',
+        );
         notifyListeners();
         return session;
       }
@@ -1128,9 +1139,9 @@ class TransferService extends ChangeNotifier {
       notifyListeners();
       return session;
     } finally {
-      if (peer.deviceType == DeviceType.web) {
-        // Web 端保留 10 分钟下载凭证，允许手机浏览器用户重复点击下载链接
-        Timer(const Duration(minutes: 10), () {
+      if (isWeb) {
+        // Web 端保留 30 分钟下载与刷新恢复凭证，允许手机浏览器用户随时点击下载或刷新页面
+        Timer(const Duration(minutes: 30), () {
           _outboundPullSessions.remove(sessionId);
         });
       } else {
@@ -1491,7 +1502,9 @@ class TransferService extends ChangeNotifier {
     button.full { width: 100%; margin-top: 6px; }
     button:hover, .btn:hover { background: #1d4ed8; }
     .btn-outline { background: #18181c; border: 1px solid #27272a; color: #e4e4e7; padding: 6px 11px; font-size: 12px; border-radius: 6px; }
-    #status { margin-top: 10px; font-size: 12.5px; color: #a1a1aa; font-family: monospace; }
+    .progress-wrap { display: none; width: 100%; height: 4px; background: #27272a; border-radius: 2px; overflow: hidden; margin-top: 10px; }
+    .progress-bar { width: 0%; height: 100%; background: #3b82f6; transition: width 0.1s linear; }
+    #status { margin-top: 8px; font-size: 12px; color: #a1a1aa; font-family: monospace; }
     .inbox-item { padding: 12px 0; border-top: 1px solid #222226; }
     .inbox-item:first-child { border-top: none; padding-top: 0; }
     .inbox-item:last-child { padding-bottom: 0; }
@@ -1514,11 +1527,12 @@ class TransferService extends ChangeNotifier {
       <div class="meta">本机节点: ${local.ip}:${local.transferPort} ($safeShortCode)</div>
       <input type="file" id="fileInput" multiple />
       <textarea id="textInput" rows="3" placeholder="输入文本或粘贴链接发送到 $safeAlias..."></textarea>
-      <button class="full" onclick="sendNow()">发送至 $safeAlias</button>
+      <button class="full" id="sendBtn" onclick="sendNow()">发送至 $safeAlias</button>
+      <div class="progress-wrap" id="progressWrap"><div class="progress-bar" id="progressBar"></div></div>
       <div id="status"></div>
     </div>
 
-    <div class="group-label">接收自 $safeAlias（在 App 中点击「Web 浏览器」即可投递到此处）</div>
+    <div class="group-label">接收自 $safeAlias（在 App 中点击浏览器设备即可投递到此处）</div>
     <div class="card" id="inboxContainer">
       <div class="empty-hint" id="emptyHint">等待 $safeAlias 发送文件或文本...</div>
       <div id="inboxList"></div>
@@ -1538,10 +1552,16 @@ class TransferService extends ChangeNotifier {
     }
 
     const osName = detectBrowserOs();
-    let webPeerId = sessionStorage.getItem('connections_web_peer_id');
-    if (!webPeerId) {
-      webPeerId = 'web-' + Math.random().toString(36).substring(2, 10);
+    let webPeerId = null;
+    try {
+      webPeerId = localStorage.getItem('connections_web_peer_id') || sessionStorage.getItem('connections_web_peer_id');
+      if (!webPeerId) {
+        webPeerId = 'web-' + Math.random().toString(36).substring(2, 10);
+      }
+      localStorage.setItem('connections_web_peer_id', webPeerId);
       sessionStorage.setItem('connections_web_peer_id', webPeerId);
+    } catch (_) {
+      webPeerId = 'web-' + Math.random().toString(36).substring(2, 10);
     }
     const webPeerProfile = {
       id: webPeerId,
@@ -1654,38 +1674,87 @@ class TransferService extends ChangeNotifier {
       setTimeout(() => { btn.innerText = old; }, 1500);
     }
 
+    function uploadSingleFileWithProgress(url, token, file, onProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.setRequestHeader('X-Upload-Token', token);
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable && onProgress) {
+            onProgress(ev.loaded, ev.total);
+          }
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve();
+          } else {
+            reject(new Error('HTTP ' + xhr.status));
+          }
+        };
+        xhr.onerror = () => reject(new Error('网络中断'));
+        xhr.send(file);
+      });
+    }
+
     async function sendNow() {
       const fileEl = document.getElementById('fileInput');
       const textEl = document.getElementById('textInput');
+      const sendBtn = document.getElementById('sendBtn');
+      const pWrap = document.getElementById('progressWrap');
+      const pBar = document.getElementById('progressBar');
       const files = fileEl.files;
       const text = textEl.value.trim();
       const status = document.getElementById('status');
       if (files.length === 0 && !text) { status.innerText = '请选择文件或输入文本'; return; }
+      sendBtn.disabled = true;
       status.innerText = '等待对方确认...';
-      const fileMeta = Array.from(files).map((f, i) => ({ id: String(i), name: f.name, size: f.size }));
-      const prepResp = await fetch('/api/prepare-upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sender: webPeerProfile,
-          files: fileMeta,
-          textMessage: text || null
-        })
-      });
-      if (!prepResp.ok) { status.innerText = '对方拒绝了请求'; return; }
-      const { sessionId, token } = await prepResp.json();
-      for (let i = 0; i < files.length; i++) {
-        status.innerText = '正在传输 (' + (i + 1) + '/' + files.length + '): ' + files[i].name;
-        const upResp = await fetch('/api/upload?sessionId=' + encodeURIComponent(sessionId) + '&fileId=' + i + '&fileName=' + encodeURIComponent(files[i].name) + '&token=' + encodeURIComponent(token), {
+      try {
+        const fileMeta = Array.from(files).map((f, i) => ({ id: String(i), name: f.name, size: f.size }));
+        const prepResp = await fetch('/api/prepare-upload', {
           method: 'POST',
-          headers: { 'X-Upload-Token': token },
-          body: files[i]
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sender: webPeerProfile,
+            files: fileMeta,
+            textMessage: text || null
+          })
         });
-        if (!upResp.ok) { status.innerText = '文件上传失败: ' + files[i].name; return; }
+        if (!prepResp.ok) { status.innerText = '对方拒绝了请求'; return; }
+        const { sessionId, token } = await prepResp.json();
+        const totalBytes = Array.from(files).reduce((acc, f) => acc + f.size, 0);
+        let completedBytes = 0;
+        const startTime = Date.now();
+        if (files.length > 0) {
+          pWrap.style.display = 'block';
+          pBar.style.width = '0%';
+        }
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i];
+          const url = '/api/upload?sessionId=' + encodeURIComponent(sessionId) +
+            '&fileId=' + i +
+            '&fileName=' + encodeURIComponent(f.name) +
+            '&token=' + encodeURIComponent(token);
+          await uploadSingleFileWithProgress(url, token, f, (loaded) => {
+            const currentTotal = completedBytes + loaded;
+            const pct = totalBytes > 0 ? Math.min(100, Math.round((currentTotal * 100) / totalBytes)) : 100;
+            const elapsedSec = Math.max(0.1, (Date.now() - startTime) / 1000);
+            const speed = formatBytes(Math.round(currentTotal / elapsedSec)) + '/s';
+            pBar.style.width = pct + '%';
+            status.innerText = '正在上传 (' + (i + 1) + '/' + files.length + ') ' + pct + '% · ' + speed;
+          });
+          completedBytes += f.size;
+        }
+        textEl.value = '';
+        fileEl.value = '';
+        pBar.style.width = '100%';
+        status.innerText = '传输已完成';
+        setTimeout(() => { pWrap.style.display = 'none'; }, 1200);
+      } catch (err) {
+        status.innerText = '发送失败: ' + (err.message || err);
+        pWrap.style.display = 'none';
+      } finally {
+        sendBtn.disabled = false;
       }
-      textEl.value = '';
-      fileEl.value = '';
-      status.innerText = '传输已完成';
     }
 
     pollHeartbeat();

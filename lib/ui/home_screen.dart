@@ -23,8 +23,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final Map<String, BuildContext> _openConfirmDialogContexts = {};
 
   bool _initialized = false;
+  bool _isRefreshingPeers = false;
 
   bool get _isMobilePlatform => Platform.isAndroid || Platform.isIOS;
+
+  Future<void> _handleRefreshPeers() async {
+    if (_isRefreshingPeers) return;
+    setState(() {
+      _isRefreshingPeers = true;
+    });
+    _discoveryService.refreshDiscovery();
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    if (mounted) {
+      setState(() {
+        _isRefreshingPeers = false;
+      });
+    }
+  }
 
   @override
   void initState() {
@@ -398,21 +413,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           _pickAndSendFiles(peer);
                         },
                       ),
-                      const Divider(
-                        height: 1,
-                        thickness: 1,
-                        color: Color(0xFF27272A),
-                        indent: 46,
-                      ),
-                      _buildActionSheetRow(
-                        icon: Icons.folder_outlined,
-                        title: '发送文件夹',
-                        subtitle: '递归保持原目录层级传输',
-                        onTap: () {
-                          Navigator.of(ctx).pop();
-                          _pickAndSendFolder(peer);
-                        },
-                      ),
+                      if (!_isMobilePlatform &&
+                          peer.deviceType != DeviceType.web) ...[
+                        const Divider(
+                          height: 1,
+                          thickness: 1,
+                          color: Color(0xFF27272A),
+                          indent: 46,
+                        ),
+                        _buildActionSheetRow(
+                          icon: Icons.folder_outlined,
+                          title: '发送文件夹',
+                          subtitle: '递归保持原目录层级传输',
+                          onTap: () {
+                            Navigator.of(ctx).pop();
+                            _pickAndSendFolder(peer);
+                          },
+                        ),
+                      ],
                       const Divider(
                         height: 1,
                         thickness: 1,
@@ -709,11 +727,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
     );
     if (text == null || text.trim().isEmpty || !mounted) return;
-    await _transferService.sendFilesToPeer(
+    final session = await _transferService.sendFilesToPeer(
       peer: peer,
       files: const [],
       textMessage: text.trim(),
     );
+    if (!mounted) return;
+    if (session.status == TransferStatus.completed) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('文本已发送至 ${peer.alias}'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } else if (session.status == TransferStatus.rejected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${peer.alias} 拒绝了接收请求'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } else if (session.status == TransferStatus.failed) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('发送失败: ${session.errorMessage ?? "连接中断"}'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
   }
 
   Future<void> _showConnectByCodeDialog() async {
@@ -1164,16 +1205,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _buildGroupHeader(
           title: '在线设备 (${peers.length})',
           trailing: InkWell(
-            onTap: _discoveryService.refreshDiscovery,
+            onTap: _isRefreshingPeers ? null : _handleRefreshPeers,
             borderRadius: BorderRadius.circular(4),
-            child: const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              child: Text(
-                '刷新',
-                style: TextStyle(
-                  color: Color(0xFF3B82F6),
-                  fontSize: 12,
-                ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_isRefreshingPeers) ...[
+                    const SizedBox(
+                      width: 10,
+                      height: 10,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.5,
+                        color: Color(0xFF3B82F6),
+                      ),
+                    ),
+                    const SizedBox(width: 5),
+                  ],
+                  Text(
+                    _isRefreshingPeers ? '刷新中' : '刷新',
+                    style: TextStyle(
+                      color: _isRefreshingPeers
+                          ? const Color(0xFF71717A)
+                          : const Color(0xFF3B82F6),
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -1358,6 +1417,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             const SizedBox(width: 6),
             IconButton(
               visualDensity: VisualDensity.compact,
+              tooltip: '发送文件',
+              onPressed: () => _pickAndSendFiles(peer),
+              icon: const Icon(
+                Icons.upload_file_outlined,
+                size: 17,
+                color: Color(0xFFA1A1AA),
+              ),
+            ),
+            IconButton(
+              visualDensity: VisualDensity.compact,
               tooltip: '发送剪贴板',
               onPressed: () => _sendClipboardInstantly(peer),
               icon: const Icon(
@@ -1366,15 +1435,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 color: Color(0xFF71717A),
               ),
             ),
-            IconButton(
-              visualDensity: VisualDensity.compact,
-              tooltip: '更多传输选项',
-              onPressed: () => _showMorePeerActions(peer),
-              icon: const Icon(
-                Icons.more_horiz_rounded,
-                size: 18,
-                color: Color(0xFFA1A1AA),
-              ),
+            const SizedBox(width: 4),
+            const Icon(
+              Icons.more_horiz_rounded,
+              size: 17,
+              color: Color(0xFF52525B),
             ),
           ],
         ),
@@ -1414,7 +1479,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 title: '局域网地址',
                 valueText: '${local.ip}:${local.transferPort} (${local.shortCode})',
                 monospaceValue: true,
-                onTap: _showConnectByCodeDialog,
+                trailing: const Icon(
+                  Icons.copy_rounded,
+                  size: 15,
+                  color: Color(0xFF71717A),
+                ),
+                onTap: () {
+                  final addr = '${local.ip}:${local.transferPort}';
+                  Clipboard.setData(ClipboardData(text: addr));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('已复制本机地址: $addr'),
+                      behavior: SnackBarBehavior.floating,
+                    ),
+                  );
+                },
               ),
               const Divider(
                 height: 1,
@@ -1509,15 +1588,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     : '在收到传输时可勾选信任指定设备',
                 valueText: '${_transferService.trustedPeerCount} 台',
                 onTap: _transferService.trustedPeerCount > 0
-                    ? () {
-                        _transferService.clearTrustedPeers();
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('已清空所有已信任设备'),
-                            behavior: SnackBarBehavior.floating,
-                          ),
-                        );
-                      }
+                    ? _confirmClearTrustedPeers
                     : null,
               ),
             ],
@@ -1525,6 +1596,53 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ],
     );
+  }
+
+  Future<void> _confirmClearTrustedPeers() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF121215),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: const BorderSide(color: Color(0xFF27272A)),
+        ),
+        title: const Text(
+          '清空已信任设备',
+          style: TextStyle(color: Color(0xFFF4F4F5), fontSize: 15.5),
+        ),
+        content: const Text(
+          '清空后，此前授权过免确认的设备向本机发送文件时，将重新弹出接收确认提示。',
+          style: TextStyle(color: Color(0xFFA1A1AA), fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFEF4444),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(6),
+              ),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted) {
+      _transferService.clearTrustedPeers();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('已清空所有已信任设备'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
   }
 
   Widget _buildSettingsRow({
@@ -1643,17 +1761,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
           clipBehavior: Clip.antiAlias,
           child: sessions.isEmpty
-              ? const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 14,
+                  ),
                   child: Row(
                     children: [
-                      Icon(
-                        Icons.swap_horiz_rounded,
-                        size: 17,
-                        color: Color(0xFF52525B),
+                      Container(
+                        width: 32,
+                        height: 32,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF18181C),
+                          borderRadius: BorderRadius.circular(7),
+                          border: Border.all(color: const Color(0xFF27272A)),
+                        ),
+                        alignment: Alignment.center,
+                        child: const Icon(
+                          Icons.swap_horiz_rounded,
+                          size: 16,
+                          color: Color(0xFF71717A),
+                        ),
                       ),
-                      SizedBox(width: 12),
-                      Text(
+                      const SizedBox(width: 12),
+                      const Text(
                         '暂无传输记录',
                         style: TextStyle(
                           color: Color(0xFF71717A),
@@ -1671,7 +1802,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           height: 1,
                           thickness: 1,
                           color: Color(0xFF222226),
-                          indent: 46,
+                          indent: 58,
                         ),
                       _buildSessionRow(sessions[i]),
                     ],
@@ -1917,17 +2048,57 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  String _formatSessionTime(DateTime dt) {
+    final h = dt.hour.toString().padLeft(2, '0');
+    final m = dt.minute.toString().padLeft(2, '0');
+    return '$h:$m';
+  }
+
+  IconData _sessionIcon(TransferSession s) {
+    if (s.files.isEmpty) return Icons.notes_rounded;
+    final hasFolder =
+        s.files.any((f) => (f.relativePath ?? '').contains('/'));
+    if (hasFolder) return Icons.folder_outlined;
+    if (s.files.length > 1) return Icons.file_copy_outlined;
+    return Icons.insert_drive_file_outlined;
+  }
+
+  Widget _buildCompactActionChip({
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(5),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: color,
+            fontSize: 12,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildSessionRow(TransferSession s) {
     final isSending = s.direction == TransferDirection.sending;
-    final statusText = switch (s.status) {
+    final isPureText = s.files.isEmpty &&
+        s.textMessage != null &&
+        s.textMessage!.isNotEmpty;
+
+    final statusLabel = switch (s.status) {
       TransferStatus.waitingConfirmation => '等待确认',
       TransferStatus.transferring =>
-        '${(s.progress * 100).toStringAsFixed(0)}% · ${TransferSession.formatSpeed(s.speedBytesPerSec)}',
-      TransferStatus.completed =>
-        '已完成 · ${TransferSession.formatSpeed(s.speedBytesPerSec)}',
+        '${(s.progress * 100).toStringAsFixed(0)}%',
+      TransferStatus.completed => '已完成',
       TransferStatus.rejected => '已拒绝',
       TransferStatus.cancelled => '已取消',
-      TransferStatus.failed => '失败: ${s.errorMessage ?? ""}',
+      TransferStatus.failed => '失败',
     };
 
     final statusColor = switch (s.status) {
@@ -1942,190 +2113,397 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final title = s.files.isNotEmpty
         ? (s.files.length == 1
             ? (s.files.first.relativePath ?? s.files.first.name)
-            : '${s.files.first.name} 等 ${s.files.length} 项 (${TransferSession.formatBytes(s.totalBytes)})')
-        : (s.textMessage ?? '文本');
+            : '${s.files.first.name} 等 ${s.files.length} 个文件')
+        : (s.textMessage?.replaceAll('\n', ' ') ?? '文本消息');
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(
-                isSending ? Icons.north_east_rounded : Icons.south_west_rounded,
-                size: 15,
-                color: const Color(0xFF71717A),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  '${isSending ? "发送至" : "接收自"} ${s.peerAlias}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Color(0xFFA1A1AA),
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-              Text(
-                statusText,
-                style: TextStyle(
-                  color: statusColor,
-                  fontSize: 11.5,
-                  fontFamily: 'monospace',
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ],
+    final metaParts = <String>[
+      '${isSending ? "↑" : "↓"} ${s.peerAlias}',
+      if (s.totalBytes > 0) TransferSession.formatBytes(s.totalBytes),
+      if (s.totalBytes > 0 &&
+          s.speedBytesPerSec > 0 &&
+          (s.status == TransferStatus.transferring ||
+              s.status == TransferStatus.completed))
+        TransferSession.formatSpeed(s.speedBytesPerSec),
+      _formatSessionTime(s.createdAt),
+    ];
+
+    VoidCallback? rowTap;
+    if (s.savedPaths.isNotEmpty) {
+      rowTap = () {
+        if (s.savedPaths.length == 1) {
+          _previewOrOpenFile(s.savedPaths.first);
+        } else {
+          _showReceivedFilesSheet(s);
+        }
+      };
+    } else if (isPureText) {
+      rowTap = () {
+        Clipboard.setData(ClipboardData(text: s.textMessage!));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('已复制文本到剪贴板'),
+            behavior: SnackBarBehavior.floating,
+            duration: Duration(seconds: 1),
           ),
-          const SizedBox(height: 4),
-          Padding(
-            padding: const EdgeInsets.only(left: 23),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        title,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Color(0xFFF4F4F5),
-                          fontSize: 13.5,
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ),
-                    if (s.isActive)
-                      TextButton(
-                        style: TextButton.styleFrom(
-                          visualDensity: VisualDensity.compact,
-                          foregroundColor: const Color(0xFFEF4444),
-                        ),
-                        onPressed: () =>
-                            _transferService.cancelSession(s.sessionId),
-                        child:
-                            const Text('取消', style: TextStyle(fontSize: 12)),
-                      ),
-                    if (s.canRetry)
-                      TextButton(
-                        style: TextButton.styleFrom(
-                          visualDensity: VisualDensity.compact,
-                          foregroundColor: const Color(0xFF3B82F6),
-                        ),
-                        onPressed: () => _transferService.retrySession(s),
-                        child:
-                            const Text('重试', style: TextStyle(fontSize: 12)),
-                      ),
-                  ],
-                ),
-                if (s.status == TransferStatus.transferring) ...[
-                  const SizedBox(height: 6),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(2),
-                    child: LinearProgressIndicator(
-                      value: s.progress,
-                      minHeight: 3,
-                      backgroundColor: const Color(0xFF27272A),
-                      color: const Color(0xFF3B82F6),
-                    ),
-                  ),
-                ],
-                if (s.textMessage != null && s.textMessage!.isNotEmpty) ...[
-                  const SizedBox(height: 6),
+        );
+      };
+    }
+
+    return InkWell(
+      onTap: rowTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 32,
+              height: 32,
+              margin: const EdgeInsets.only(top: 1),
+              decoration: BoxDecoration(
+                color: const Color(0xFF18181C),
+                borderRadius: BorderRadius.circular(7),
+                border: Border.all(color: const Color(0xFF27272A)),
+              ),
+              alignment: Alignment.center,
+              child: Icon(
+                _sessionIcon(s),
+                size: 16,
+                color: const Color(0xFFA1A1AA),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                   Row(
                     children: [
                       Expanded(
                         child: Text(
-                          s.textMessage!,
-                          maxLines: 2,
+                          title,
+                          maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
-                            color: Color(0xFFA1A1AA),
-                            fontSize: 12,
+                            color: Color(0xFFF4F4F5),
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
                           ),
                         ),
                       ),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        tooltip: '复制文本',
-                        onPressed: () {
-                          Clipboard.setData(
-                            ClipboardData(text: s.textMessage!),
-                          );
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('已复制到剪贴板'),
-                              duration: Duration(seconds: 1),
-                            ),
-                          );
-                        },
-                        icon: const Icon(
-                          Icons.copy_rounded,
-                          size: 14,
-                          color: Color(0xFFA1A1AA),
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 1.5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: statusColor.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          statusLabel,
+                          style: TextStyle(
+                            color: statusColor,
+                            fontSize: 11,
+                            fontFamily: 'monospace',
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
                       ),
                     ],
                   ),
-                ],
-                if (s.savedPaths.isNotEmpty) ...[
                   const SizedBox(height: 4),
                   Row(
                     children: [
                       Expanded(
-                        child: SelectableText(
-                          s.savedPaths.length == 1
-                              ? s.savedPaths.first
-                              : '${s.savedPaths.first} 等 ${s.savedPaths.length} 个文件',
+                        child: Text(
+                          metaParts.join(' · '),
                           maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
                             color: Color(0xFF71717A),
-                            fontSize: 11,
+                            fontSize: 11.5,
                             fontFamily: 'monospace',
                           ),
                         ),
                       ),
-                      TextButton(
-                        style: TextButton.styleFrom(
-                          visualDensity: VisualDensity.compact,
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                          foregroundColor: const Color(0xFF3B82F6),
+                      if (s.isActive)
+                        _buildCompactActionChip(
+                          label: '取消',
+                          color: const Color(0xFFEF4444),
+                          onTap: () =>
+                              _transferService.cancelSession(s.sessionId),
                         ),
-                        onPressed: () =>
-                            _previewOrOpenFile(s.savedPaths.first),
-                        child: Text(
-                          _isMobilePlatform ? '查看' : '打开',
-                          style: const TextStyle(fontSize: 12),
+                      if (s.canRetry)
+                        _buildCompactActionChip(
+                          label: '重试',
+                          color: const Color(0xFF3B82F6),
+                          onTap: () => _transferService.retrySession(s),
                         ),
-                      ),
-                      if (!_isMobilePlatform)
-                        TextButton(
-                          style: TextButton.styleFrom(
-                            visualDensity: VisualDensity.compact,
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            foregroundColor: const Color(0xFFA1A1AA),
-                          ),
-                          onPressed: () {
-                            SystemFileOpener.revealInFolder(s.savedPaths.first);
+                      if (s.textMessage != null && s.textMessage!.isNotEmpty)
+                        _buildCompactActionChip(
+                          label: '复制',
+                          color: isPureText
+                              ? const Color(0xFF3B82F6)
+                              : const Color(0xFFA1A1AA),
+                          onTap: () {
+                            Clipboard.setData(
+                              ClipboardData(text: s.textMessage!),
+                            );
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('已复制到剪贴板'),
+                                behavior: SnackBarBehavior.floating,
+                                duration: Duration(seconds: 1),
+                              ),
+                            );
                           },
-                          child: const Text(
-                            '定位',
-                            style: TextStyle(fontSize: 12),
-                          ),
                         ),
+                      if (s.savedPaths.isNotEmpty) ...[
+                        _buildCompactActionChip(
+                          label: s.savedPaths.length > 1
+                              ? '列表(${s.savedPaths.length})'
+                              : (_isMobilePlatform ? '查看' : '打开'),
+                          color: const Color(0xFF3B82F6),
+                          onTap: () {
+                            if (s.savedPaths.length == 1) {
+                              _previewOrOpenFile(s.savedPaths.first);
+                            } else {
+                              _showReceivedFilesSheet(s);
+                            }
+                          },
+                        ),
+                        if (!_isMobilePlatform)
+                          _buildCompactActionChip(
+                            label: '定位',
+                            color: const Color(0xFFA1A1AA),
+                            onTap: () {
+                              SystemFileOpener.revealInFolder(
+                                s.savedPaths.first,
+                              );
+                            },
+                          ),
+                      ],
                     ],
                   ),
+                  if (s.status == TransferStatus.transferring) ...[
+                    const SizedBox(height: 7),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(2),
+                      child: LinearProgressIndicator(
+                        value: s.progress,
+                        minHeight: 3,
+                        backgroundColor: const Color(0xFF27272A),
+                        color: const Color(0xFF3B82F6),
+                      ),
+                    ),
+                  ],
+                  if (s.files.isNotEmpty &&
+                      s.textMessage != null &&
+                      s.textMessage!.isNotEmpty) ...[
+                    const SizedBox(height: 5),
+                    Text(
+                      '附言: ${s.textMessage!.replaceAll('\n', ' ')}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Color(0xFFA1A1AA),
+                        fontSize: 11.5,
+                      ),
+                    ),
+                  ],
+                  if (s.status == TransferStatus.failed &&
+                      s.errorMessage != null &&
+                      s.errorMessage!.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      s.errorMessage!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Color(0xFFEF4444),
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
                 ],
-              ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showReceivedFilesSheet(TransferSession session) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF121215),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+        side: BorderSide(color: Color(0xFF27272A)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.sizeOf(ctx).height * 0.78,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.folder_copy_outlined,
+                          size: 18,
+                          color: Color(0xFFA1A1AA),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            '已接收文件 (${session.savedPaths.length})',
+                            style: const TextStyle(
+                              color: Color(0xFFF4F4F5),
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          icon: const Icon(
+                            Icons.close,
+                            size: 18,
+                            color: Color(0xFF71717A),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Flexible(
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF18181C),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFF27272A)),
+                      ),
+                      clipBehavior: Clip.antiAlias,
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: session.savedPaths.length,
+                        separatorBuilder: (_, _) => const Divider(
+                          height: 1,
+                          thickness: 1,
+                          color: Color(0xFF27272A),
+                          indent: 42,
+                        ),
+                        itemBuilder: (_, index) {
+                          final path = session.savedPaths[index];
+                          final name = path
+                              .replaceAll('\\', '/')
+                              .split('/')
+                              .where((s) => s.isNotEmpty)
+                              .lastOrNull ??
+                              path;
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 10,
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(
+                                  Icons.insert_drive_file_outlined,
+                                  size: 16,
+                                  color: Color(0xFF71717A),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          color: Color(0xFFF4F4F5),
+                                          fontSize: 13.5,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        path,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          color: Color(0xFF71717A),
+                                          fontSize: 11,
+                                          fontFamily: 'monospace',
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                TextButton(
+                                  style: TextButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
+                                    foregroundColor: const Color(0xFF3B82F6),
+                                  ),
+                                  onPressed: () {
+                                    Navigator.of(ctx).pop();
+                                    _previewOrOpenFile(path);
+                                  },
+                                  child: Text(
+                                    _isMobilePlatform ? '查看' : '打开',
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                                if (!_isMobilePlatform)
+                                  TextButton(
+                                    style: TextButton.styleFrom(
+                                      visualDensity: VisualDensity.compact,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                      ),
+                                      foregroundColor: const Color(0xFFA1A1AA),
+                                    ),
+                                    onPressed: () {
+                                      SystemFileOpener.revealInFolder(path);
+                                    },
+                                    child: const Text(
+                                      '定位',
+                                      style: TextStyle(fontSize: 12),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
