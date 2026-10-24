@@ -12,6 +12,169 @@ import 'settings_service.dart';
 
 typedef IncomingRequestResolver = Future<bool> Function(TransferSession session);
 
+class _UploadSegmentTask {
+  final TransferFileItem fileItem;
+  final int fileIndex;
+  final int offset;
+  final int length;
+  final int segmentIndex;
+  final int totalSegments;
+
+  const _UploadSegmentTask({
+    required this.fileItem,
+    required this.fileIndex,
+    required this.offset,
+    required this.length,
+    required this.segmentIndex,
+    required this.totalSegments,
+  });
+}
+
+class _ActiveFileReceiveContext {
+  final TransferFileItem fileItem;
+  final File finalFile;
+  final File partFile;
+  final int initialOffset;
+  final Stopwatch fileStopwatch = Stopwatch()..start();
+  RandomAccessFile? _raf;
+  Future<void> _ioChain = Future<void>.value();
+  final Map<int, ({int currentEnd, int targetEnd})> _segments = {};
+  int contiguousBytes;
+  int bytesSinceLastFlush = 0;
+  bool isFinalized = false;
+  bool isAborted = false;
+
+  _ActiveFileReceiveContext({
+    required this.fileItem,
+    required this.finalFile,
+    required this.partFile,
+    required this.initialOffset,
+  }) : contiguousBytes = initialOffset;
+
+  Future<void> ensureOpen() {
+    return _enqueueIo(() async {
+      if (_raf != null || isAborted || isFinalized) return;
+      _raf = await partFile.open(mode: FileMode.append);
+      if (initialOffset == 0 && await _raf!.length() > 0) {
+        await _raf!.truncate(0);
+      }
+    });
+  }
+
+  void registerSegment(int sliceStart, int sliceEnd) {
+    _segments.putIfAbsent(
+      sliceStart,
+      () => (currentEnd: sliceStart, targetEnd: sliceEnd),
+    );
+  }
+
+  Future<void> writeChunk({
+    required int sliceStart,
+    required int sliceEnd,
+    required int writeOffset,
+    required List<int> bytes,
+    required int flushThresholdBytes,
+  }) {
+    return _enqueueIo(() async {
+      if (isAborted || isFinalized) {
+        throw const SocketException('文件接收上下文已关闭');
+      }
+      final raf = _raf ??= await partFile.open(mode: FileMode.append);
+      await raf.setPosition(writeOffset);
+      await raf.writeFrom(bytes);
+
+      final newEnd = writeOffset + bytes.length;
+      final existing = _segments[sliceStart];
+      final prevEnd = existing?.currentEnd ?? sliceStart;
+      _segments[sliceStart] = (
+        currentEnd: max(prevEnd, newEnd),
+        targetEnd: sliceEnd,
+      );
+      _advanceContiguousFrontier();
+
+      bytesSinceLastFlush += bytes.length;
+      if (bytesSinceLastFlush >= flushThresholdBytes) {
+        bytesSinceLastFlush = 0;
+        await raf.flush();
+      }
+    });
+  }
+
+  void _advanceContiguousFrontier() {
+    final starts = _segments.keys.toList()..sort();
+    for (final start in starts) {
+      final seg = _segments[start]!;
+      if (start <= contiguousBytes) {
+        if (seg.currentEnd > contiguousBytes) {
+          contiguousBytes = seg.currentEnd;
+        }
+        if (seg.currentEnd >= seg.targetEnd &&
+            seg.targetEnd <= contiguousBytes) {
+          _segments.remove(start);
+        }
+      } else {
+        break;
+      }
+    }
+  }
+
+  Future<File?> tryFinalize(File Function() resolveFallbackFinal) {
+    return _enqueueIo<File?>(() async {
+      if (isFinalized || isAborted) return null;
+      if (contiguousBytes < fileItem.size) return null;
+      isFinalized = true;
+      if (_raf != null) {
+        await _raf!.flush();
+        await _raf!.close();
+        _raf = null;
+      }
+      final resolvedFinal =
+          finalFile.existsSync() ? resolveFallbackFinal() : finalFile;
+      await partFile.rename(resolvedFinal.path);
+      return resolvedFinal;
+    });
+  }
+
+  Future<void> abort({required bool deletePartFile}) {
+    return _enqueueIo(() async {
+      if (isFinalized || isAborted) return;
+      isAborted = true;
+      if (_raf != null) {
+        try {
+          if (!deletePartFile && contiguousBytes > 0) {
+            await _raf!.truncate(contiguousBytes);
+            await _raf!.flush();
+          }
+        } catch (_) {}
+        try {
+          await _raf!.close();
+        } catch (_) {}
+        _raf = null;
+      }
+      if (deletePartFile || contiguousBytes <= 0) {
+        try {
+          if (partFile.existsSync()) {
+            partFile.deleteSync();
+          }
+        } catch (_) {}
+      }
+    });
+  }
+
+  Future<T> _enqueueIo<T>(Future<T> Function() action) {
+    final completer = Completer<T>();
+    _ioChain = _ioChain.then((_) async {
+      try {
+        final res = await action();
+        completer.complete(res);
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    });
+    return completer.future;
+  }
+}
+
 class _OutboundPullContext {
   final TransferSession session;
   final String peerId;
@@ -35,6 +198,11 @@ class _OutboundPullContext {
 
 class TransferService extends ChangeNotifier {
   static const int _maxControlBodyBytes = 1024 * 1024; // 1 MB 控制信令上限
+  static const int _sendChunkCoalesceBytes = 512 * 1024; // 512 KB 发送聚合块
+  static const int _diskWriteBufferBytes = 1024 * 1024; // 1 MB 磁盘顺序写聚合块
+  static const int _flushBackpressureBytes = 8 * 1024 * 1024; // 8 MB 背压刷盘阈值
+  static const int _parallelSegmentSizeBytes = 16 * 1024 * 1024; // 16 MB 大文件多路并发分片大小
+  static const int _uiNotifyIntervalMs = 150; // 150ms UI 进度节流间隔
 
   final DiscoveryService discoveryService;
   HttpServer? _server;
@@ -42,13 +210,20 @@ class TransferService extends ChangeNotifier {
   bool _autoAccept = false;
   late String _saveDirectoryPath;
   final Set<String> _trustedPeerIds = {};
+  final Set<String> _ensuredDirPaths = {};
+  final Set<String> _reservedTargetPaths = {};
 
   IncomingRequestResolver? onIncomingTransferRequest;
   ValueChanged<String>? onSessionCancelled;
 
   final List<TransferSession> _sessions = [];
   final Map<String, TransferSession> _activeReceivingSessions = {};
+  final Map<String, Map<String, _ActiveFileReceiveContext>>
+      _sessionFileContexts = {};
+  final Map<String, int> _receivingSessionInitialBytes = {};
   final Map<String, Stopwatch> _receivingSessionStopwatches = {};
+  final Map<String, int> _receivingSessionLastNotifyMs = {};
+  final Map<String, int> _receivingSessionLastLogMs = {};
   final Map<String, String> _sessionTokens = {};
   final Map<String, Completer<bool>> _pendingConfirmations = {};
   final Map<String, HttpClient> _activeSendingClients = {};
@@ -112,15 +287,19 @@ class TransferService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 清理异常断电或强退遗留的 .part 临时文件
+  /// 清理超过 24 小时未续传的陈旧 .part 临时文件（保留近期未传完的 .part 以支持断点续传）
   void _cleanStalePartFiles() {
     try {
       final dir = Directory(_saveDirectoryPath);
       if (!dir.existsSync()) return;
+      final now = DateTime.now();
       for (final entity in dir.listSync(recursive: true, followLinks: false)) {
         if (entity is File && entity.path.endsWith('.part')) {
           try {
-            entity.deleteSync();
+            final age = now.difference(entity.statSync().modified);
+            if (age.inHours >= 24) {
+              entity.deleteSync();
+            }
           } catch (_) {}
         }
       }
@@ -143,6 +322,7 @@ class TransferService extends ChangeNotifier {
         return false;
       }
       _saveDirectoryPath = dir.path;
+      _ensuredDirPaths.clear();
       final current = SettingsService.load();
       unawaited(
         SettingsService.save(current.copyWith(saveDirectoryPath: dir.path)),
@@ -390,6 +570,17 @@ class TransferService extends ChangeNotifier {
     _cancelledSessionIds.add(sessionId);
     _sessionTokens.remove(sessionId);
     _receivingSessionStopwatches.remove(sessionId);
+    _receivingSessionInitialBytes.remove(sessionId);
+    _receivingSessionLastNotifyMs.remove(sessionId);
+    _receivingSessionLastLogMs.remove(sessionId);
+
+    final fileContexts = _sessionFileContexts.remove(sessionId);
+    if (fileContexts != null) {
+      for (final fCtx in fileContexts.values) {
+        _reservedTargetPaths.remove(fCtx.finalFile.path);
+        unawaited(fCtx.abort(deletePartFile: true));
+      }
+    }
 
     final pending = _pendingConfirmations.remove(sessionId);
     if (pending != null && !pending.isCompleted) {
@@ -569,10 +760,43 @@ class TransferService extends ChangeNotifier {
       return;
     }
 
+    _ensuredDirPaths.clear();
+    _ensureDirectoryExists(_saveDirectoryPath);
+
+    final fileContexts = <String, _ActiveFileReceiveContext>{};
+    final resumeOffsets = <String, int>{};
+    int initialSessionBytes = 0;
+
+    for (final fileItem in files) {
+      final resolved =
+          _resolveTargetOrResumableFile(_saveDirectoryPath, fileItem);
+      _reservedTargetPaths.add(resolved.finalFile.path);
+      fileContexts[fileItem.id] = _ActiveFileReceiveContext(
+        fileItem: fileItem,
+        finalFile: resolved.finalFile,
+        partFile: resolved.partFile,
+        initialOffset: resolved.resumeOffset,
+      );
+      if (resolved.resumeOffset > 0) {
+        resumeOffsets[fileItem.id] = resolved.resumeOffset;
+        initialSessionBytes += resolved.resumeOffset;
+      }
+    }
+
+    session.transferredBytes = initialSessionBytes;
     session.status = TransferStatus.transferring;
     _activeReceivingSessions[sessionId] = session;
+    _sessionFileContexts[sessionId] = fileContexts;
+    _receivingSessionInitialBytes[sessionId] = initialSessionBytes;
     _receivingSessionStopwatches[sessionId] = Stopwatch()..start();
+    _receivingSessionLastNotifyMs[sessionId] = 0;
+    _receivingSessionLastLogMs[sessionId] = 0;
     _sessionTokens[sessionId] = uploadToken;
+    if (initialSessionBytes > 0) {
+      TransferLogger.recv(
+        '🔄 启用断点续传 [$sessionId] -> 已存在进度: ${TransferSession.formatBytes(initialSessionBytes)}',
+      );
+    }
     notifyListeners();
 
     request.response.headers.contentType = ContentType.json;
@@ -580,6 +804,8 @@ class TransferService extends ChangeNotifier {
       'accepted': true,
       'sessionId': sessionId,
       'token': uploadToken,
+      'parallelChunkSize': _parallelSegmentSizeBytes,
+      if (resumeOffsets.isNotEmpty) 'resumeOffsets': resumeOffsets,
     }));
     await request.response.close();
   }
@@ -592,8 +818,10 @@ class TransferService extends ChangeNotifier {
         '';
     final session = _activeReceivingSessions[sessionId];
     final expectedToken = _sessionTokens[sessionId];
+    final sessionFilesMap = _sessionFileContexts[sessionId];
 
     if (session == null ||
+        sessionFilesMap == null ||
         _cancelledSessionIds.contains(sessionId) ||
         expectedToken == null ||
         token != expectedToken) {
@@ -604,61 +832,90 @@ class TransferService extends ChangeNotifier {
       return;
     }
 
-    // 严格校验 fileId 必须在已批准的会话文件清单内
-    final matchingFiles = session.files.where((f) => f.id == fileId);
-    if (matchingFiles.isEmpty) {
+    final fileCtx = sessionFilesMap[fileId];
+    if (fileCtx == null) {
       await request.drain<void>();
       request.response.statusCode = HttpStatus.badRequest;
       request.response.write(jsonEncode({'error': '未声明的文件 ID'}));
       await request.response.close();
       return;
     }
-    final fileItem = matchingFiles.first;
+    final fileItem = fileCtx.fileItem;
 
-    final saveDir = Directory(_saveDirectoryPath);
-    if (!saveDir.existsSync()) {
-      saveDir.createSync(recursive: true);
+    final rawOffset = request.uri.queryParameters['offset'];
+    final rawLength = request.uri.queryParameters['length'];
+    final sliceStart =
+        rawOffset != null ? (int.tryParse(rawOffset) ?? 0) : fileCtx.initialOffset;
+    final sliceLength = rawLength != null
+        ? (int.tryParse(rawLength) ?? max(0, fileItem.size - sliceStart))
+        : max(0, fileItem.size - sliceStart);
+    final sliceEnd = sliceStart + sliceLength;
+
+    if (sliceStart < 0 ||
+        sliceLength < 0 ||
+        (fileItem.size > 0 && sliceEnd > fileItem.size)) {
+      await request.drain<void>();
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write(jsonEncode({'error': '分片偏移范围越界'}));
+      await request.response.close();
+      return;
     }
 
-    final finalFile = _resolveTargetFile(saveDir.path, fileItem);
-    final partFile = File('${finalFile.path}.part');
-    final sink = partFile.openWrite();
+    await fileCtx.ensureOpen();
+    fileCtx.registerSegment(sliceStart, sliceEnd);
 
-    final fileStopwatch = Stopwatch()..start();
+    final writeBuffer = BytesBuilder(copy: false);
     final sessionStopwatch =
-        _receivingSessionStopwatches[sessionId] ?? fileStopwatch;
-    int lastNotifyMs = 0;
-    int lastLogMs = 0;
-    int bytesInCurrentFile = 0;
+        _receivingSessionStopwatches[sessionId] ?? fileCtx.fileStopwatch;
+    final initialSessionBytes = _receivingSessionInitialBytes[sessionId] ?? 0;
+    int writeCursor = sliceStart;
+    int bytesInSlice = 0;
 
-    TransferLogger.recv(
-      '开始接收文件 [$sessionId] -> ${fileItem.relativePath ?? fileItem.name} '
-      '(${TransferSession.formatBytes(fileItem.size)})',
-    );
+    if (sliceStart == fileCtx.initialOffset) {
+      TransferLogger.recv(
+        '开始接收文件 [$sessionId] -> ${fileItem.relativePath ?? fileItem.name} '
+        '(${TransferSession.formatBytes(fileItem.size)}'
+        '${fileCtx.initialOffset > 0 ? ", 续传起点: ${TransferSession.formatBytes(fileCtx.initialOffset)}" : ""})',
+      );
+    }
 
     try {
       await for (final chunk in request) {
         if (_cancelledSessionIds.contains(sessionId)) {
           throw const SocketException('用户已取消接收');
         }
-        bytesInCurrentFile += chunk.length;
-        if (fileItem.size > 0 && bytesInCurrentFile > fileItem.size) {
-          throw const HttpException('接收字节数超出声明的文件大小');
+        bytesInSlice += chunk.length;
+        if (fileItem.size > 0 && bytesInSlice > sliceLength) {
+          throw const HttpException('接收字节数超出声明的分片大小');
         }
-        sink.add(chunk);
+        writeBuffer.add(chunk);
+        if (writeBuffer.length >= _diskWriteBufferBytes) {
+          final bytesToWrite = writeBuffer.takeBytes();
+          await fileCtx.writeChunk(
+            sliceStart: sliceStart,
+            sliceEnd: sliceEnd,
+            writeOffset: writeCursor,
+            bytes: bytesToWrite,
+            flushThresholdBytes: _flushBackpressureBytes,
+          );
+          writeCursor += bytesToWrite.length;
+        }
         session.transferredBytes += chunk.length;
 
         final elapsedMs = sessionStopwatch.elapsedMilliseconds;
-        if (elapsedMs - lastNotifyMs >= 100) {
-          lastNotifyMs = elapsedMs;
+        final lastNotifyMs = _receivingSessionLastNotifyMs[sessionId] ?? 0;
+        if (elapsedMs - lastNotifyMs >= _uiNotifyIntervalMs) {
+          _receivingSessionLastNotifyMs[sessionId] = elapsedMs;
           if (elapsedMs > 0) {
-            session.speedBytesPerSec =
-                (session.transferredBytes * 1000) / elapsedMs;
+            final deltaBytes =
+                max(0, session.transferredBytes - initialSessionBytes);
+            session.speedBytesPerSec = (deltaBytes * 1000) / elapsedMs;
           }
           notifyListeners();
         }
+        final lastLogMs = _receivingSessionLastLogMs[sessionId] ?? 0;
         if (elapsedMs - lastLogMs >= 500) {
-          lastLogMs = elapsedMs;
+          _receivingSessionLastLogMs[sessionId] = elapsedMs;
           final pct = (session.progress * 100).toStringAsFixed(1);
           TransferLogger.recv(
             '接收进度 [$sessionId] ${fileItem.name}: $pct% '
@@ -667,76 +924,205 @@ class TransferService extends ChangeNotifier {
           );
         }
       }
-      await sink.flush();
-      await sink.close();
+      if (writeBuffer.isNotEmpty) {
+        final bytesToWrite = writeBuffer.takeBytes();
+        await fileCtx.writeChunk(
+          sliceStart: sliceStart,
+          sliceEnd: sliceEnd,
+          writeOffset: writeCursor,
+          bytes: bytesToWrite,
+          flushThresholdBytes: _flushBackpressureBytes,
+        );
+        writeCursor += bytesToWrite.length;
+      }
 
-      // 严格校验文件完整性（防止发送端网络闪断导致半截文件被当作完整文件保存）
-      if (fileItem.size > 0 && bytesInCurrentFile != fileItem.size) {
+      if (fileItem.size > 0 && bytesInSlice != sliceLength) {
         throw HttpException(
-          '文件完整性校验失败：预期 ${fileItem.size} B，实际接收 $bytesInCurrentFile B',
+          '分片完整性校验失败：预期 $sliceLength B，实际接收 $bytesInSlice B',
         );
       }
 
-      // 原子重命名 .part 临时文件为最终文件（若原定目标路径未被并发任务抢占则直接使用，避免因自身 .part 存在而误追加 (1)）
-      final resolvedFinal = finalFile.existsSync()
-          ? _resolveTargetFile(saveDir.path, fileItem)
-          : finalFile;
-      await partFile.rename(resolvedFinal.path);
+      File? finalizedFile;
+      if (fileCtx.contiguousBytes >= fileItem.size) {
+        _reservedTargetPaths.remove(fileCtx.finalFile.path);
+        finalizedFile = await fileCtx.tryFinalize(
+          () => _resolveTargetFile(_saveDirectoryPath, fileItem),
+        );
+      }
 
-      final fileElapsedMs = max(1, fileStopwatch.elapsedMilliseconds);
-      final sessionElapsedMs = max(1, sessionStopwatch.elapsedMilliseconds);
-      session.speedBytesPerSec =
-          (session.transferredBytes * 1000) / sessionElapsedMs;
+      if (finalizedFile != null) {
+        final fileElapsedMs = max(1, fileCtx.fileStopwatch.elapsedMilliseconds);
+        final sessionElapsedMs = max(1, sessionStopwatch.elapsedMilliseconds);
+        final deltaBytes =
+            max(0, session.transferredBytes - initialSessionBytes);
+        session.speedBytesPerSec = (deltaBytes * 1000) / sessionElapsedMs;
 
-      TransferLogger.recv(
-        '文件落盘完成 [$sessionId]: ${resolvedFinal.path} '
-        '| 大小: ${TransferSession.formatBytes(bytesInCurrentFile)} '
-        '| 耗时: ${fileElapsedMs}ms '
-        '| 速率: ${TransferSession.formatSpeed(session.speedBytesPerSec)}',
-      );
-
-      session.savedPaths.add(resolvedFinal.path);
-      if (session.savedPaths.length >= session.files.length) {
-        session.status = TransferStatus.completed;
-        session.transferredBytes = session.totalBytes;
-        _activeReceivingSessions.remove(sessionId);
-        _receivingSessionStopwatches.remove(sessionId);
-        _sessionTokens.remove(sessionId);
         TransferLogger.recv(
-          '✅ 会话全部接收完成 [$sessionId] | 共 ${session.savedPaths.length} 个文件 '
-          '(${TransferSession.formatBytes(session.totalBytes)})',
+          '文件落盘完成 [$sessionId]: ${finalizedFile.path} '
+          '| 大小: ${TransferSession.formatBytes(fileItem.size)} '
+          '| 耗时: ${fileElapsedMs}ms '
+          '| 速率: ${TransferSession.formatSpeed(session.speedBytesPerSec)}',
         );
+
+        session.savedPaths.add(finalizedFile.path);
+        if (session.savedPaths.length >= session.files.length) {
+          session.status = TransferStatus.completed;
+          session.transferredBytes = session.totalBytes;
+          _activeReceivingSessions.remove(sessionId);
+          _sessionFileContexts.remove(sessionId);
+          _receivingSessionInitialBytes.remove(sessionId);
+          _receivingSessionStopwatches.remove(sessionId);
+          _receivingSessionLastNotifyMs.remove(sessionId);
+          _receivingSessionLastLogMs.remove(sessionId);
+          _sessionTokens.remove(sessionId);
+          TransferLogger.recv(
+            '✅ 会话全部接收完成 [$sessionId] | 共 ${session.savedPaths.length} 个文件 '
+            '(${TransferSession.formatBytes(session.totalBytes)})',
+          );
+        }
+        notifyListeners();
       }
-      notifyListeners();
 
       request.response.headers.contentType = ContentType.json;
       request.response.write(jsonEncode({
         'ok': true,
-        'savedPath': resolvedFinal.path,
+        'savedPath': finalizedFile?.path ?? fileCtx.finalFile.path,
       }));
       await request.response.close();
     } catch (e) {
-      await sink.close();
-      try {
-        if (partFile.existsSync()) {
-          partFile.deleteSync();
+      final isCancelled = _cancelledSessionIds.contains(sessionId);
+      if (!isCancelled && writeBuffer.isNotEmpty) {
+        try {
+          final remainingBytes = writeBuffer.takeBytes();
+          await fileCtx.writeChunk(
+            sliceStart: sliceStart,
+            sliceEnd: sliceEnd,
+            writeOffset: writeCursor,
+            bytes: remainingBytes,
+            flushThresholdBytes: _flushBackpressureBytes,
+          );
+          writeCursor += remainingBytes.length;
+        } catch (_) {}
+      }
+      final allContexts = _sessionFileContexts.remove(sessionId);
+      if (allContexts != null) {
+        for (final fCtx in allContexts.values) {
+          _reservedTargetPaths.remove(fCtx.finalFile.path);
+          await fCtx.abort(deletePartFile: isCancelled);
         }
-      } catch (_) {}
+      } else {
+        _reservedTargetPaths.remove(fileCtx.finalFile.path);
+        await fileCtx.abort(deletePartFile: isCancelled);
+      }
 
-      if (_cancelledSessionIds.contains(sessionId)) {
+      if (isCancelled) {
         session.status = TransferStatus.cancelled;
         TransferLogger.recv('⚠️ 接收已取消 [$sessionId]: ${fileItem.name}');
       } else {
         session.status = TransferStatus.failed;
         session.errorMessage = e.toString();
-        TransferLogger.error('Recv', '接收失败 [$sessionId] (${fileItem.name}): $e');
+        TransferLogger.error(
+          'Recv',
+          '接收中断 [$sessionId] (${fileItem.name}, 已保留连续断点 ${TransferSession.formatBytes(fileCtx.contiguousBytes)}): $e',
+        );
       }
       _activeReceivingSessions.remove(sessionId);
+      _receivingSessionInitialBytes.remove(sessionId);
       _receivingSessionStopwatches.remove(sessionId);
+      _receivingSessionLastNotifyMs.remove(sessionId);
+      _receivingSessionLastLogMs.remove(sessionId);
       _sessionTokens.remove(sessionId);
       notifyListeners();
       rethrow;
     }
+  }
+
+  void _ensureDirectoryExists(String dirPath) {
+    if (_ensuredDirPaths.contains(dirPath)) return;
+    final dir = Directory(dirPath);
+    if (!dir.existsSync()) {
+      dir.createSync(recursive: true);
+    }
+    _ensuredDirPaths.add(dirPath);
+  }
+
+  ({File finalFile, File partFile, int resumeOffset})
+      _resolveTargetOrResumableFile(String baseDirPath, TransferFileItem item) {
+    if (item.relativePath != null && item.relativePath!.trim().isNotEmpty) {
+      final rawSegments = item.relativePath!
+          .replaceAll('\\', '/')
+          .split('/')
+          .where((seg) => seg.isNotEmpty && seg != '.' && seg != '..')
+          .map((seg) => seg.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_'))
+          .toList();
+
+      if (rawSegments.length > 1) {
+        final subDirs = rawSegments
+            .sublist(0, rawSegments.length - 1)
+            .join(Platform.pathSeparator);
+        final targetSubDirPath =
+            '$baseDirPath${Platform.pathSeparator}$subDirs';
+        _ensureDirectoryExists(targetSubDirPath);
+        return _resolveUniqueOrResumableFile(
+          targetSubDirPath,
+          rawSegments.last,
+          item.size,
+        );
+      }
+    }
+    return _resolveUniqueOrResumableFile(baseDirPath, item.name, item.size);
+  }
+
+  ({File finalFile, File partFile, int resumeOffset})
+      _resolveUniqueOrResumableFile(
+    String dirPath,
+    String rawFileName,
+    int expectedSize,
+  ) {
+    final safeName =
+        rawFileName.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_');
+    final dotIndex = safeName.lastIndexOf('.');
+    final baseName =
+        dotIndex > 0 ? safeName.substring(0, dotIndex) : safeName;
+    final ext = dotIndex > 0 ? safeName.substring(dotIndex) : '';
+
+    // 优先检查是否存在未完成的断点 .part 文件且未被其他活跃传输占用
+    for (int counter = 0; counter < 50; counter++) {
+      final candidate = counter == 0
+          ? File('$dirPath${Platform.pathSeparator}$safeName')
+          : File('$dirPath${Platform.pathSeparator}$baseName ($counter)$ext');
+      if (_reservedTargetPaths.contains(candidate.path)) {
+        continue;
+      }
+      final candidatePart = File('${candidate.path}.part');
+      if (!candidate.existsSync() && candidatePart.existsSync()) {
+        try {
+          final existingLen = candidatePart.lengthSync();
+          if (existingLen > 0 && existingLen < expectedSize) {
+            return (
+              finalFile: candidate,
+              partFile: candidatePart,
+              resumeOffset: existingLen,
+            );
+          } else if (existingLen == 0 || existingLen >= expectedSize) {
+            // 大小为 0 或超过预期大小（可能同名不同文件），清理旧 .part 重新写入
+            candidatePart.deleteSync();
+            return (
+              finalFile: candidate,
+              partFile: candidatePart,
+              resumeOffset: 0,
+            );
+          }
+        } catch (_) {}
+      }
+    }
+
+    final resolved = _resolveUniqueFile(dirPath, rawFileName);
+    return (
+      finalFile: resolved,
+      partFile: File('${resolved.path}.part'),
+      resumeOffset: 0,
+    );
   }
 
   File _resolveTargetFile(String baseDirPath, TransferFileItem item) {
@@ -752,12 +1138,10 @@ class TransferService extends ChangeNotifier {
         final subDirs = rawSegments
             .sublist(0, rawSegments.length - 1)
             .join(Platform.pathSeparator);
-        final targetSubDir =
-            Directory('$baseDirPath${Platform.pathSeparator}$subDirs');
-        if (!targetSubDir.existsSync()) {
-          targetSubDir.createSync(recursive: true);
-        }
-        return _resolveUniqueFile(targetSubDir.path, rawSegments.last);
+        final targetSubDirPath =
+            '$baseDirPath${Platform.pathSeparator}$subDirs';
+        _ensureDirectoryExists(targetSubDirPath);
+        return _resolveUniqueFile(targetSubDirPath, rawSegments.last);
       }
     }
     return _resolveUniqueFile(baseDirPath, item.name);
@@ -767,7 +1151,9 @@ class TransferService extends ChangeNotifier {
     final safeName =
         rawFileName.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_');
     var candidate = File('$dirPath${Platform.pathSeparator}$safeName');
-    if (!candidate.existsSync() && !File('${candidate.path}.part').existsSync()) {
+    if (!_reservedTargetPaths.contains(candidate.path) &&
+        !candidate.existsSync() &&
+        !File('${candidate.path}.part').existsSync()) {
       return candidate;
     }
 
@@ -777,7 +1163,8 @@ class TransferService extends ChangeNotifier {
     final ext = dotIndex > 0 ? safeName.substring(dotIndex) : '';
 
     int counter = 1;
-    while (candidate.existsSync() ||
+    while (_reservedTargetPaths.contains(candidate.path) ||
+        candidate.existsSync() ||
         File('${candidate.path}.part').existsSync()) {
       candidate =
           File('$dirPath${Platform.pathSeparator}$baseName ($counter)$ext');
@@ -838,7 +1225,7 @@ class TransferService extends ChangeNotifier {
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 3)
       ..idleTimeout = const Duration(seconds: 30)
-      ..maxConnectionsPerHost = 6
+      ..maxConnectionsPerHost = 8
       ..autoUncompress = false;
     _activeSendingClients[localSessionId] = client;
     _activeSendingRemotes[localSessionId] = (
@@ -894,6 +1281,11 @@ class TransferService extends ChangeNotifier {
       final remoteSessionId =
           prepJson['sessionId'] as String? ?? localSessionId;
       final uploadToken = prepJson['token'] as String? ?? '';
+      final rawResumeOffsets =
+          prepJson['resumeOffsets'] as Map<String, dynamic>? ?? const {};
+      final parallelChunkSize =
+          (prepJson['parallelChunkSize'] as num?)?.toInt() ??
+              _parallelSegmentSizeBytes;
 
       _activeSendingRemotes[localSessionId] = (
         ip: peer.ip,
@@ -908,48 +1300,116 @@ class TransferService extends ChangeNotifier {
         return session;
       }
 
+      // 构建多文件与单大文件多路分片任务队列（支持断点续传与 16MB 滑动窗口并发）
+      final segmentTasks = <_UploadSegmentTask>[];
+      int resumedTotal = 0;
+
+      for (int i = 0; i < files.length; i++) {
+        final fileItem = files[i];
+        final rawResume =
+            (rawResumeOffsets[fileItem.id] as num?)?.toInt() ?? 0;
+        final resumeOffset = rawResume.clamp(0, fileItem.size);
+        resumedTotal += resumeOffset;
+
+        final remainingBytes = fileItem.size - resumeOffset;
+        if (fileItem.size > 0 && remainingBytes == 0) {
+          continue;
+        }
+
+        if (fileItem.size == 0 ||
+            parallelChunkSize <= 0 ||
+            remainingBytes <= parallelChunkSize) {
+          segmentTasks.add(
+            _UploadSegmentTask(
+              fileItem: fileItem,
+              fileIndex: i,
+              offset: resumeOffset,
+              length: remainingBytes,
+              segmentIndex: 0,
+              totalSegments: 1,
+            ),
+          );
+        } else {
+          final totalSegments =
+              (remainingBytes + parallelChunkSize - 1) ~/ parallelChunkSize;
+          int segIdx = 0;
+          for (int offset = resumeOffset;
+              offset < fileItem.size;
+              offset += parallelChunkSize) {
+            final segLen = min(parallelChunkSize, fileItem.size - offset);
+            segmentTasks.add(
+              _UploadSegmentTask(
+                fileItem: fileItem,
+                fileIndex: i,
+                offset: offset,
+                length: segLen,
+                segmentIndex: segIdx++,
+                totalSegments: totalSegments,
+              ),
+            );
+          }
+        }
+      }
+
+      session.transferredBytes = resumedTotal;
       session.status = TransferStatus.transferring;
       notifyListeners();
 
       final stopwatch = Stopwatch()..start();
       int lastNotifyMs = 0;
       int lastLogMs = 0;
+      int bytesSentInCurrentRun = 0;
 
-      // 多文件并发流水线传输（Keep-Alive 连接复用，最多 4 路并发消除海量小文件 RTT 延迟）
-      final concurrency = files.length > 1 ? min(4, files.length) : 1;
+      // 多文件/大文件分片并发流水线传输（Keep-Alive 连接复用，最多 6 路并发）
+      final concurrency =
+          segmentTasks.isEmpty ? 1 : min(6, segmentTasks.length);
       TransferLogger.send(
-        '对方已接受 [$localSessionId]，开始流式上传 (并发通道数: $concurrency)...',
+        '对方已接受 [$localSessionId]，开始流式上传 '
+        '(分片任务数: ${segmentTasks.length}, 并发通道数: $concurrency'
+        '${resumedTotal > 0 ? ", 已跳过断点: ${TransferSession.formatBytes(resumedTotal)}" : ""})...',
       );
-      int nextFileIndex = 0;
+      int nextTaskIndex = 0;
 
       Future<void> uploadWorker() async {
         while (true) {
           if (_cancelledSessionIds.contains(localSessionId)) {
             return;
           }
-          final idx = nextFileIndex++;
-          if (idx >= files.length) return;
-          final fileItem = files[idx];
+          final taskIdx = nextTaskIndex++;
+          if (taskIdx >= segmentTasks.length) return;
+          final task = segmentTasks[taskIdx];
+          final fileItem = task.fileItem;
 
-          TransferLogger.send(
-            '上传文件 [${idx + 1}/${files.length}]: ${fileItem.relativePath ?? fileItem.name} '
-            '(${TransferSession.formatBytes(fileItem.size)})',
-          );
+          if (task.segmentIndex == 0) {
+            TransferLogger.send(
+              '上传文件 [${task.fileIndex + 1}/${files.length}]: '
+              '${fileItem.relativePath ?? fileItem.name} '
+              '(${TransferSession.formatBytes(fileItem.size)}'
+              '${task.offset > 0 ? ", 续传起点: ${TransferSession.formatBytes(task.offset)}" : ""}'
+              '${task.totalSegments > 1 ? ", 并发分片: ${task.totalSegments}片" : ""})',
+            );
+          }
 
           final uploadUri = Uri.parse(
             'http://${peer.ip}:${peer.transferPort}/api/upload'
             '?sessionId=${Uri.encodeComponent(remoteSessionId)}'
             '&fileId=${Uri.encodeComponent(fileItem.id)}'
-            '&fileName=${Uri.encodeComponent(fileItem.name)}',
+            '&fileName=${Uri.encodeComponent(fileItem.name)}'
+            '&offset=${task.offset}'
+            '&length=${task.length}',
           );
 
           final uploadReq = await client.postUrl(uploadUri);
           uploadReq.headers.contentType = ContentType.binary;
           uploadReq.headers.set('X-Upload-Token', uploadToken);
-          uploadReq.bufferOutput = false; // 禁用额外输出缓冲，直通 Socket
-          uploadReq.contentLength = fileItem.size;
+          uploadReq.contentLength = task.length;
 
-          final rawStream = _openFileOrMemoryStream(fileItem);
+          final rawStream = _openFileOrMemoryStream(
+            fileItem,
+            start: task.offset,
+            end: task.offset + task.length,
+          );
+          final coalesceBuffer = BytesBuilder(copy: false);
           final trackedStream = rawStream.transform<List<int>>(
             StreamTransformer.fromHandlers(
               handleData: (chunk, sink) {
@@ -957,15 +1417,20 @@ class TransferService extends ChangeNotifier {
                   sink.addError(const SocketException('用户已取消发送'));
                   return;
                 }
-                sink.add(chunk);
-                session.transferredBytes += chunk.length;
+                coalesceBuffer.add(chunk);
+                if (coalesceBuffer.length >= _sendChunkCoalesceBytes) {
+                  sink.add(coalesceBuffer.takeBytes());
+                }
+                bytesSentInCurrentRun += chunk.length;
+                session.transferredBytes =
+                    min(session.totalBytes, resumedTotal + bytesSentInCurrentRun);
 
                 final elapsedMs = stopwatch.elapsedMilliseconds;
-                if (elapsedMs - lastNotifyMs >= 100) {
+                if (elapsedMs - lastNotifyMs >= _uiNotifyIntervalMs) {
                   lastNotifyMs = elapsedMs;
                   if (elapsedMs > 0) {
                     session.speedBytesPerSec =
-                        (session.transferredBytes * 1000) / elapsedMs;
+                        (bytesSentInCurrentRun * 1000) / elapsedMs;
                   }
                   notifyListeners();
                 }
@@ -979,6 +1444,15 @@ class TransferService extends ChangeNotifier {
                   );
                 }
               },
+              handleDone: (sink) {
+                if (!_cancelledSessionIds.contains(localSessionId) &&
+                    coalesceBuffer.isNotEmpty) {
+                  sink.add(coalesceBuffer.takeBytes());
+                } else {
+                  coalesceBuffer.clear();
+                }
+                sink.close();
+              },
             ),
           );
 
@@ -988,13 +1462,15 @@ class TransferService extends ChangeNotifier {
           await uploadResp.drain<void>();
           if (uploadResp.statusCode != HttpStatus.ok) {
             throw Exception(
-              '文件 ${fileItem.name} 传输失败 (${uploadResp.statusCode})',
+              '文件 ${fileItem.name} 分片传输失败 (${uploadResp.statusCode})',
             );
           }
         }
       }
 
-      await Future.wait(List.generate(concurrency, (_) => uploadWorker()));
+      if (segmentTasks.isNotEmpty) {
+        await Future.wait(List.generate(concurrency, (_) => uploadWorker()));
+      }
 
       if (_cancelledSessionIds.contains(localSessionId)) {
         session.status = TransferStatus.cancelled;
@@ -1004,8 +1480,10 @@ class TransferService extends ChangeNotifier {
       }
 
       final totalElapsedMs = max(1, stopwatch.elapsedMilliseconds);
-      session.speedBytesPerSec =
-          (session.transferredBytes * 1000) / totalElapsedMs;
+      if (bytesSentInCurrentRun > 0) {
+        session.speedBytesPerSec =
+            (bytesSentInCurrentRun * 1000) / totalElapsedMs;
+      }
       session.status = TransferStatus.completed;
       session.transferredBytes = session.totalBytes;
       TransferLogger.send(
@@ -1035,17 +1513,35 @@ class TransferService extends ChangeNotifier {
     }
   }
 
-  Stream<List<int>> _openFileOrMemoryStream(TransferFileItem fileItem) async* {
+  Stream<List<int>> _openFileOrMemoryStream(
+    TransferFileItem fileItem, {
+    int? start,
+    int? end,
+  }) {
     if (fileItem.localPath != null) {
-      yield* File(fileItem.localPath!).openRead();
-    } else if (fileItem.memoryBytes != null) {
-      final bytes = fileItem.memoryBytes!;
-      const chunkSize = 64 * 1024;
-      for (int offset = 0; offset < bytes.length; offset += chunkSize) {
-        final end = min(offset + chunkSize, bytes.length);
-        yield bytes.sublist(offset, end);
-      }
+      return File(fileItem.localPath!).openRead(start, end);
     }
+    final bytes = fileItem.memoryBytes;
+    if (bytes == null || bytes.isEmpty) {
+      return const Stream<List<int>>.empty();
+    }
+    final startPos = (start ?? 0).clamp(0, bytes.length);
+    final endPos = (end ?? bytes.length).clamp(startPos, bytes.length);
+    if (startPos >= endPos) {
+      return const Stream<List<int>>.empty();
+    }
+    final chunks = <List<int>>[];
+    for (int offset = startPos;
+        offset < endPos;
+        offset += _sendChunkCoalesceBytes) {
+      final chunkEnd = min(offset + _sendChunkCoalesceBytes, endPos);
+      chunks.add(
+        bytes is Uint8List
+            ? Uint8List.sublistView(bytes, offset, chunkEnd)
+            : bytes.sublist(offset, chunkEnd),
+      );
+    }
+    return Stream<List<int>>.fromIterable(chunks);
   }
 
   /// 反向拉取发送模式：适用于目标节点处于单向 NAT（如 Android 模拟器 10.0.2.16）、Web 浏览器或防火墙阻止入站连接的场景
@@ -1194,6 +1690,10 @@ class TransferService extends ChangeNotifier {
       return;
     }
     final fileItem = matching.first;
+    final rawOffset =
+        int.tryParse(request.uri.queryParameters['offset'] ?? '') ?? 0;
+    final startOffset = rawOffset.clamp(0, fileItem.size);
+    final remainingLength = fileItem.size - startOffset;
 
     final encodedFileName = Uri.encodeComponent(fileItem.name);
     request.response.headers.contentType = ContentType.binary;
@@ -1201,10 +1701,23 @@ class TransferService extends ChangeNotifier {
       'Content-Disposition',
       'attachment; filename="$encodedFileName"; filename*=UTF-8\'\'$encodedFileName',
     );
-    request.response.contentLength = fileItem.size;
-    request.response.bufferOutput = false;
+    request.response.contentLength = remainingLength;
 
-    final rawStream = _openFileOrMemoryStream(fileItem);
+    if (!ctx.isWebPeer && startOffset > 0) {
+      ctx.session.transferredBytes = min(
+        ctx.session.totalBytes,
+        ctx.session.transferredBytes + startOffset,
+      );
+    }
+
+    final rawStream = _openFileOrMemoryStream(
+      fileItem,
+      start: startOffset,
+      end: fileItem.size,
+    );
+    final coalesceBuffer = BytesBuilder(copy: false);
+    final downloadStopwatch = Stopwatch()..start();
+    int downloadBytes = 0;
     final trackedStream = rawStream.transform<List<int>>(
       StreamTransformer.fromHandlers(
         handleData: (chunk, sink) {
@@ -1212,18 +1725,28 @@ class TransferService extends ChangeNotifier {
             sink.addError(const SocketException('用户已取消发送'));
             return;
           }
-          sink.add(chunk);
-          ctx.session.transferredBytes = min(
-            ctx.session.totalBytes,
-            ctx.session.transferredBytes + chunk.length,
-          );
+          coalesceBuffer.add(chunk);
+          if (coalesceBuffer.length >= _sendChunkCoalesceBytes) {
+            sink.add(coalesceBuffer.takeBytes());
+          }
+          downloadBytes += chunk.length;
+          if (!ctx.isWebPeer) {
+            ctx.session.transferredBytes = min(
+              ctx.session.totalBytes,
+              ctx.session.transferredBytes + chunk.length,
+            );
+          }
 
-          final elapsedMs = ctx.stopwatch.elapsedMilliseconds;
-          if (elapsedMs - ctx.lastNotifyMs >= 100) {
+          final elapsedMs = ctx.isWebPeer
+              ? downloadStopwatch.elapsedMilliseconds
+              : ctx.stopwatch.elapsedMilliseconds;
+          if (elapsedMs - ctx.lastNotifyMs >= _uiNotifyIntervalMs) {
             ctx.lastNotifyMs = elapsedMs;
             if (elapsedMs > 0) {
+              final measuredBytes =
+                  ctx.isWebPeer ? downloadBytes : ctx.session.transferredBytes;
               ctx.session.speedBytesPerSec =
-                  (ctx.session.transferredBytes * 1000) / elapsedMs;
+                  (measuredBytes * 1000) / elapsedMs;
             }
             notifyListeners();
           }
@@ -1235,6 +1758,15 @@ class TransferService extends ChangeNotifier {
               '| 速率: ${TransferSession.formatSpeed(ctx.session.speedBytesPerSec)}',
             );
           }
+        },
+        handleDone: (sink) {
+          if (!_cancelledSessionIds.contains(sessionId) &&
+              coalesceBuffer.isNotEmpty) {
+            sink.add(coalesceBuffer.takeBytes());
+          } else {
+            coalesceBuffer.clear();
+          }
+          sink.close();
         },
       ),
     );
@@ -1357,27 +1889,40 @@ class TransferService extends ChangeNotifier {
       }
 
       // 2. 逐个拉取文件流并原子落盘
+      _ensuredDirPaths.clear();
       session.status = TransferStatus.transferring;
       notifyListeners();
 
-      final saveDir = Directory(_saveDirectoryPath);
-      if (!saveDir.existsSync()) {
-        saveDir.createSync(recursive: true);
-      }
+      _ensureDirectoryExists(_saveDirectoryPath);
 
       final stopwatch = Stopwatch()..start();
       int lastNotifyMs = 0;
+      int bytesReceivedInRun = 0;
 
       for (final fileItem in files) {
         if (_cancelledSessionIds.contains(sessionId)) {
           throw const SocketException('用户已取消接收');
         }
 
+        final targetInfo =
+            _resolveTargetOrResumableFile(_saveDirectoryPath, fileItem);
+        final finalFile = targetInfo.finalFile;
+        final partFile = targetInfo.partFile;
+        final resumeOffset = targetInfo.resumeOffset;
+
+        if (resumeOffset > 0) {
+          session.transferredBytes = min(
+            session.totalBytes,
+            session.transferredBytes + resumeOffset,
+          );
+        }
+
         final pullUri = Uri.parse(
           'http://${senderPeer.ip}:${senderPeer.transferPort}/api/pull-file'
           '?sessionId=${Uri.encodeComponent(sessionId)}'
           '&fileId=${Uri.encodeComponent(fileItem.id)}'
-          '&token=${Uri.encodeComponent(token)}',
+          '&token=${Uri.encodeComponent(token)}'
+          '${resumeOffset > 0 ? "&offset=$resumeOffset" : ""}',
         );
 
         final pullReq = await client.getUrl(pullUri);
@@ -1388,10 +1933,12 @@ class TransferService extends ChangeNotifier {
           throw HttpException('拉取文件失败 (${pullResp.statusCode})');
         }
 
-        final finalFile = _resolveTargetFile(saveDir.path, fileItem);
-        final partFile = File('${finalFile.path}.part');
-        final sink = partFile.openWrite();
-        int bytesInFile = 0;
+        final sink = partFile.openWrite(
+          mode: resumeOffset > 0 ? FileMode.append : FileMode.write,
+        );
+        final writeBuffer = BytesBuilder(copy: false);
+        int bytesInFile = resumeOffset;
+        int unflushedBytes = 0;
 
         try {
           await for (final chunk in pullResp) {
@@ -1399,18 +1946,31 @@ class TransferService extends ChangeNotifier {
               throw const SocketException('用户已取消接收');
             }
             bytesInFile += chunk.length;
-            sink.add(chunk);
+            bytesReceivedInRun += chunk.length;
+            writeBuffer.add(chunk);
+            if (writeBuffer.length >= _diskWriteBufferBytes) {
+              final bufferedLen = writeBuffer.length;
+              sink.add(writeBuffer.takeBytes());
+              unflushedBytes += bufferedLen;
+              if (unflushedBytes >= _flushBackpressureBytes) {
+                unflushedBytes = 0;
+                await sink.flush();
+              }
+            }
             session.transferredBytes += chunk.length;
 
             final elapsedMs = stopwatch.elapsedMilliseconds;
-            if (elapsedMs - lastNotifyMs >= 100) {
+            if (elapsedMs - lastNotifyMs >= _uiNotifyIntervalMs) {
               lastNotifyMs = elapsedMs;
               if (elapsedMs > 0) {
                 session.speedBytesPerSec =
-                    (session.transferredBytes * 1000) / elapsedMs;
+                    (bytesReceivedInRun * 1000) / elapsedMs;
               }
               notifyListeners();
             }
+          }
+          if (writeBuffer.isNotEmpty) {
+            sink.add(writeBuffer.takeBytes());
           }
           await sink.flush();
           await sink.close();
@@ -1420,7 +1980,7 @@ class TransferService extends ChangeNotifier {
           }
 
           final resolvedFinal = finalFile.existsSync()
-              ? _resolveTargetFile(saveDir.path, fileItem)
+              ? _resolveTargetFile(_saveDirectoryPath, fileItem)
               : finalFile;
           await partFile.rename(resolvedFinal.path);
           session.savedPaths.add(resolvedFinal.path);
@@ -1430,10 +1990,18 @@ class TransferService extends ChangeNotifier {
             '(${TransferSession.formatBytes(bytesInFile)})',
           );
         } catch (e) {
+          if (writeBuffer.isNotEmpty) {
+            try {
+              sink.add(writeBuffer.takeBytes());
+              await sink.flush();
+            } catch (_) {}
+          }
           await sink.close();
-          try {
-            if (partFile.existsSync()) partFile.deleteSync();
-          } catch (_) {}
+          if (_cancelledSessionIds.contains(sessionId)) {
+            try {
+              if (partFile.existsSync()) partFile.deleteSync();
+            } catch (_) {}
+          }
           rethrow;
         }
       }

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:connections/models/transfer_item.dart';
 import 'package:connections/services/discovery_service.dart';
@@ -174,6 +175,73 @@ void main() {
         equals('Reverse Pull NAT Traversal Success!'),
       );
       savedPullFile.deleteSync();
+
+      // 6. 验证大文件断点续传 (.part 连续前沿恢复 + resumeOffsets 协商)
+      final resumeFileName = 'resumable_test_archive.bin';
+      final fullResumePayload = Uint8List.fromList(
+        List<int>.generate(200000, (i) => (i * 17 + 3) & 0xFF),
+      );
+      final targetResumePath =
+          '${transferB.saveDirectoryPath}${Platform.pathSeparator}$resumeFileName';
+      final targetResumePart = File('$targetResumePath.part');
+      if (File(targetResumePath).existsSync()) {
+        File(targetResumePath).deleteSync();
+      }
+      // 模拟此前中断时已落盘前 120,000 字节
+      targetResumePart.writeAsBytesSync(
+        Uint8List.sublistView(fullResumePayload, 0, 120000),
+        flush: true,
+      );
+
+      final resumeSession = await transferA.sendFilesToPeer(
+        peer: foundPeerB.copyWith(ip: '127.0.0.1', transferPort: portB),
+        files: [
+          TransferFileItem(
+            id: 'resume-file-1',
+            name: resumeFileName,
+            size: fullResumePayload.length,
+            memoryBytes: fullResumePayload,
+          ),
+        ],
+      );
+      expect(resumeSession.status, equals(TransferStatus.completed));
+      final savedResumeFile = File(transferB.sessions.first.savedPaths.first);
+      expect(savedResumeFile.path, equals(targetResumePath));
+      expect(savedResumeFile.existsSync(), isTrue);
+      expect(targetResumePart.existsSync(), isFalse);
+      expect(savedResumeFile.readAsBytesSync(), equals(fullResumePayload));
+      savedResumeFile.deleteSync();
+
+      // 7. 验证单大文件 (> 16MB) 多路分片并发传输 (Parallel Range Upload) 与随机偏移无洞落盘
+      const largeSize = 36 * 1024 * 1024; // 36 MB -> 切分为 16MB + 16MB + 4MB 三路并发分片
+      final largePayload = Uint8List(largeSize);
+      for (int i = 0; i < largeSize; i += 4093) {
+        largePayload[i] = (i * 31 + (i >> 12)) & 0xFF;
+      }
+      largePayload[largeSize - 1] = 0xAB;
+
+      final largeSession = await transferA.sendFilesToPeer(
+        peer: foundPeerB.copyWith(ip: '127.0.0.1', transferPort: portB),
+        files: [
+          TransferFileItem(
+            id: 'parallel-large-1',
+            name: 'parallel_36mb_test.bin',
+            size: largeSize,
+            memoryBytes: largePayload,
+          ),
+        ],
+      );
+      expect(largeSession.status, equals(TransferStatus.completed));
+      final savedLargeFile = File(transferB.sessions.first.savedPaths.first);
+      expect(savedLargeFile.existsSync(), isTrue);
+      expect(savedLargeFile.lengthSync(), equals(largeSize));
+      final verifiedBytes = savedLargeFile.readAsBytesSync();
+      expect(verifiedBytes.length, equals(largeSize));
+      for (int i = 0; i < largeSize; i += 4093) {
+        expect(verifiedBytes[i], equals((i * 31 + (i >> 12)) & 0xFF));
+      }
+      expect(verifiedBytes[largeSize - 1], equals(0xAB));
+      savedLargeFile.deleteSync();
     } finally {
       transferA.dispose();
       transferB.dispose();

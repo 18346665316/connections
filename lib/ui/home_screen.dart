@@ -272,6 +272,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
               onPressed: () {
                 _transferService.toggleTrustPeer(session.peerId, trust: true);
+                if (mounted) setState(() {});
                 Navigator.of(ctx).pop(true);
               },
               child: const Text('信任并接收', style: TextStyle(fontSize: 12.5)),
@@ -478,6 +479,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             value: isTrusted,
                             onChanged: (v) {
                               _transferService.toggleTrustPeer(peer.id, trust: v);
+                              if (mounted) setState(() {});
                               Navigator.of(ctx).pop();
                             },
                           ),
@@ -487,6 +489,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             peer.id,
                             trust: !isTrusted,
                           );
+                          if (mounted) setState(() {});
                           Navigator.of(ctx).pop();
                         },
                       ),
@@ -613,7 +616,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               .replaceAll('\\', '/')
               .replaceFirst(RegExp(r'^/+'), '');
           final relPath = '$folderName/$subPath';
-          final size = await entity.length();
+          final size = entity.statSync().size;
 
           items.add(
             TransferFileItem(
@@ -932,11 +935,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: Listenable.merge([_discoveryService, _transferService]),
+      animation: _discoveryService,
       builder: (context, _) {
         final local = _discoveryService.localDevice;
         final peers = _discoveryService.peers;
-        final sessions = _transferService.sessions;
         final screenWidth = MediaQuery.sizeOf(context).width;
         final isCompactHeader = screenWidth < 540;
         final isUltraNarrow = screenWidth < 420;
@@ -1094,7 +1096,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             child: ListView(
                               padding: const EdgeInsets.fromLTRB(18, 18, 18, 28),
                               children: [
-                                _buildTransfersGroup(sessions),
+                                AnimatedBuilder(
+                                  animation: _transferService,
+                                  builder: (context, _) => _buildTransfersGroup(
+                                    _transferService.sessions,
+                                  ),
+                                ),
                               ],
                             ),
                           ),
@@ -1106,7 +1113,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       children: [
                         _buildOnlinePeersGroup(peers),
                         const SizedBox(height: 22),
-                        _buildTransfersGroup(sessions),
+                        AnimatedBuilder(
+                          animation: _transferService,
+                          builder: (context, _) =>
+                              _buildTransfersGroup(_transferService.sessions),
+                        ),
                       ],
                     );
                   },
@@ -1636,6 +1647,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
     if (confirmed == true && mounted) {
       _transferService.clearTrustedPeers();
+      setState(() {});
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('已清空所有已信任设备'),
