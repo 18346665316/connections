@@ -363,7 +363,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               ),
                             ),
                             Text(
-                              '${peer.os} · ${peer.ip}:${peer.transferPort} (${peer.shortCode})',
+                              '${peer.os} · ${peer.endpointLabel} (${peer.shortCode})',
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
@@ -806,7 +806,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   const Text(
-                    '同一局域网下的手机或电脑扫码即可直接通过浏览器向本机发送文件与文本',
+                    '同一局域网下的手机或电脑扫码后，即可在浏览器与本机之间双向收发文件与文本',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Color(0xFFA1A1AA), fontSize: 12.5),
                   ),
@@ -1343,7 +1343,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    '${peer.os} · ${peer.ip}:${peer.transferPort} (${peer.shortCode})',
+                    '${peer.os} · ${peer.endpointLabel} (${peer.shortCode})',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(

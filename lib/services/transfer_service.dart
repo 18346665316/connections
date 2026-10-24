@@ -811,18 +811,20 @@ class TransferService extends ChangeNotifier {
     notifyListeners();
 
     TransferLogger.send(
-      '发起传输请求 -> 目标: ${peer.alias} (${peer.ip}:${peer.transferPort}) '
+      '发起传输请求 -> 目标: ${peer.alias} (${peer.endpointLabel}) '
       '| 会话: $localSessionId | 文件数: ${files.length} '
       '| 总大小: ${TransferSession.formatBytes(totalBytes)}'
       '${textMessage != null ? " | 附带文本: ${textMessage.length}字" : ""}',
     );
 
-    // 若目标处于 Android 模拟器 NAT 网段 (10.0.2.x) 且本机是宿主机，直接走反向拉取通道（避免宿主机直连 10.0.2.16 被 RST）
-    final isTargetEmulatorNat = peer.ip.startsWith('10.0.2.') &&
-        !discoveryService.localDevice.ip.startsWith('10.0.2.');
-    if (isTargetEmulatorNat) {
+    // 若目标为 Web 浏览器节点，或处于 Android 模拟器 NAT 网段 (10.0.2.x)，自动走反向拉取通道
+    final useReversePull = peer.deviceType == DeviceType.web ||
+        peer.transferPort <= 0 ||
+        (peer.ip.startsWith('10.0.2.') &&
+            !discoveryService.localDevice.ip.startsWith('10.0.2.'));
+    if (useReversePull) {
       TransferLogger.send(
-        '目标 ${peer.alias} (${peer.ip}) 位于模拟器/NAT网段，自动启用反向拉取 (Reverse-Pull) 通道...',
+        '目标 ${peer.alias} (${peer.endpointLabel}) 启用反向拉取 (Reverse-Pull) 通道...',
       );
       return _sendViaReversePull(
         peer: peer,
@@ -1126,7 +1128,14 @@ class TransferService extends ChangeNotifier {
       notifyListeners();
       return session;
     } finally {
-      _outboundPullSessions.remove(sessionId);
+      if (peer.deviceType == DeviceType.web) {
+        // Web 端保留 10 分钟下载凭证，允许手机浏览器用户重复点击下载链接
+        Timer(const Duration(minutes: 10), () {
+          _outboundPullSessions.remove(sessionId);
+        });
+      } else {
+        _outboundPullSessions.remove(sessionId);
+      }
     }
   }
 
@@ -1175,7 +1184,12 @@ class TransferService extends ChangeNotifier {
     }
     final fileItem = matching.first;
 
+    final encodedFileName = Uri.encodeComponent(fileItem.name);
     request.response.headers.contentType = ContentType.binary;
+    request.response.headers.set(
+      'Content-Disposition',
+      'attachment; filename="$encodedFileName"; filename*=UTF-8\'\'$encodedFileName',
+    );
     request.response.contentLength = fileItem.size;
     request.response.bufferOutput = false;
 
@@ -1188,7 +1202,10 @@ class TransferService extends ChangeNotifier {
             return;
           }
           sink.add(chunk);
-          ctx.session.transferredBytes += chunk.length;
+          ctx.session.transferredBytes = min(
+            ctx.session.totalBytes,
+            ctx.session.transferredBytes + chunk.length,
+          );
 
           final elapsedMs = ctx.stopwatch.elapsedMilliseconds;
           if (elapsedMs - ctx.lastNotifyMs >= 100) {
@@ -1445,7 +1462,7 @@ class TransferService extends ChangeNotifier {
     );
   }
 
-  /// 内置轻量网页端：未安装 App 的手机或电脑浏览器访问 `http://<ip>:<port>` 也能直接发文件给本机
+  /// 内置双向网页端：未安装 App 的手机或电脑浏览器扫码访问 `http://<ip>:<port>` 即可与本机双向收发文件与文本
   Future<void> _handleWebPortal(HttpRequest request) async {
     final local = discoveryService.localDevice;
     const htmlEscape = HtmlEscape();
@@ -1460,26 +1477,183 @@ class TransferService extends ChangeNotifier {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>邻传 - $safeAlias</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #09090b; color: #f4f4f5; margin: 0; padding: 24px; display: flex; justify-content: center; }
-    .card { max-width: 440px; width: 100%; background: #121215; border: 1px solid #27272a; border-radius: 10px; padding: 24px; }
-    .meta { font-family: monospace; color: #71717a; font-size: 12px; margin-bottom: 16px; }
-    h2 { margin: 0 0 6px 0; font-size: 18px; font-weight: 600; }
-    input[type="file"], textarea { width: 100%; box-sizing: border-box; margin: 10px 0; padding: 10px 12px; border-radius: 8px; border: 1px solid #27272a; background: #09090b; color: #f4f4f5; font-size: 13px; }
-    button { width: 100%; background: #2563eb; color: white; border: none; padding: 11px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; margin-top: 8px; }
-    button:hover { background: #1d4ed8; }
-    #status { margin-top: 12px; font-size: 13px; color: #a1a1aa; font-family: monospace; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #09090b; color: #f4f4f5; margin: 0; padding: 20px 16px 40px; display: flex; justify-content: center; }
+    .wrap { max-width: 480px; width: 100%; }
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px solid #27272a; }
+    .title { font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+    .badge { font-family: monospace; font-size: 11.5px; color: #10b981; background: rgba(16, 185, 129, 0.12); padding: 3px 8px; border-radius: 5px; }
+    .group-label { color: #71717a; font-size: 12px; font-weight: 500; margin: 18px 4px 8px; }
+    .card { background: #121215; border: 1px solid #27272a; border-radius: 10px; padding: 16px; }
+    .meta { font-family: monospace; color: #71717a; font-size: 12px; margin-bottom: 12px; }
+    input[type="file"], textarea { width: 100%; margin: 8px 0; padding: 10px 12px; border-radius: 8px; border: 1px solid #27272a; background: #09090b; color: #f4f4f5; font-size: 13px; }
+    button, .btn { display: inline-flex; align-items: center; justify-content: center; background: #2563eb; color: white; border: none; padding: 10px 14px; border-radius: 8px; font-size: 13.5px; font-weight: 500; cursor: pointer; text-decoration: none; }
+    button.full { width: 100%; margin-top: 6px; }
+    button:hover, .btn:hover { background: #1d4ed8; }
+    .btn-outline { background: #18181c; border: 1px solid #27272a; color: #e4e4e7; padding: 6px 11px; font-size: 12px; border-radius: 6px; }
+    #status { margin-top: 10px; font-size: 12.5px; color: #a1a1aa; font-family: monospace; }
+    .inbox-item { padding: 12px 0; border-top: 1px solid #222226; }
+    .inbox-item:first-child { border-top: none; padding-top: 0; }
+    .inbox-item:last-child { padding-bottom: 0; }
+    .file-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; background: #09090b; border: 1px solid #27272a; border-radius: 7px; padding: 8px 10px; }
+    .file-name { font-size: 13px; word-break: break-all; flex: 1; }
+    .file-size { font-family: monospace; font-size: 11.5px; color: #71717a; margin-right: 6px; white-space: nowrap; }
+    .text-box { margin-top: 8px; background: #09090b; border: 1px solid #27272a; border-radius: 7px; padding: 10px 12px; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+    .empty-hint { color: #71717a; font-size: 13px; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h2>$safeAlias</h2>
-    <div class="meta">${local.ip}:${local.transferPort} · $safeShortCode</div>
-    <input type="file" id="fileInput" multiple />
-    <textarea id="textInput" rows="3" placeholder="输入文本内容..."></textarea>
-    <button onclick="sendNow()">发送至 $safeAlias</button>
-    <div id="status"></div>
+  <div class="wrap">
+    <div class="header">
+      <div class="title">邻传 · $safeAlias</div>
+      <div class="badge" id="connBadge">已连接本机</div>
+    </div>
+
+    <div class="group-label">发送至 $safeAlias</div>
+    <div class="card">
+      <div class="meta">本机节点: ${local.ip}:${local.transferPort} ($safeShortCode)</div>
+      <input type="file" id="fileInput" multiple />
+      <textarea id="textInput" rows="3" placeholder="输入文本或粘贴链接发送到 $safeAlias..."></textarea>
+      <button class="full" onclick="sendNow()">发送至 $safeAlias</button>
+      <div id="status"></div>
+    </div>
+
+    <div class="group-label">接收自 $safeAlias（在 App 中点击「Web 浏览器」即可投递到此处）</div>
+    <div class="card" id="inboxContainer">
+      <div class="empty-hint" id="emptyHint">等待 $safeAlias 发送文件或文本...</div>
+      <div id="inboxList"></div>
+    </div>
   </div>
+
   <script>
+    function detectBrowserOs() {
+      const ua = navigator.userAgent || '';
+      if (/iPhone/i.test(ua)) return 'iPhone';
+      if (/iPad/i.test(ua)) return 'iPad';
+      if (/Android/i.test(ua)) return 'Android';
+      if (/Macintosh|Mac OS X/i.test(ua)) return 'macOS';
+      if (/Windows/i.test(ua)) return 'Windows';
+      if (/Linux/i.test(ua)) return 'Linux';
+      return 'Web';
+    }
+
+    const osName = detectBrowserOs();
+    let webPeerId = sessionStorage.getItem('connections_web_peer_id');
+    if (!webPeerId) {
+      webPeerId = 'web-' + Math.random().toString(36).substring(2, 10);
+      sessionStorage.setItem('connections_web_peer_id', webPeerId);
+    }
+    const webPeerProfile = {
+      id: webPeerId,
+      alias: osName + ' 浏览器',
+      avatar: 'web',
+      deviceType: 'web',
+      os: osName + ' Web',
+      ip: '0.0.0.0',
+      transferPort: 0
+    };
+
+    const seenOfferIds = new Set();
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+      return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+    }
+
+    async function pollHeartbeat() {
+      try {
+        const resp = await fetch('/api/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(webPeerProfile)
+        });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const badge = document.getElementById('connBadge');
+        badge.innerText = '在线 · ' + webPeerProfile.alias;
+        if (Array.isArray(data.pullOffers)) {
+          for (const offer of data.pullOffers) {
+            if (!offer.sessionId || seenOfferIds.has(offer.sessionId)) continue;
+            seenOfferIds.add(offer.sessionId);
+            await handleIncomingOffer(offer);
+          }
+        }
+      } catch (_) {
+        document.getElementById('connBadge').innerText = '重连中...';
+      }
+    }
+
+    async function handleIncomingOffer(offer) {
+      // 立即通知本机：浏览器已收到推送会话
+      await fetch('/api/pull-decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: offer.sessionId,
+          token: offer.token,
+          accepted: true
+        })
+      });
+
+      const emptyHint = document.getElementById('emptyHint');
+      if (emptyHint) emptyHint.style.display = 'none';
+
+      const list = document.getElementById('inboxList');
+      const item = document.createElement('div');
+      item.className = 'inbox-item';
+
+      const timeStr = new Date().toLocaleTimeString();
+      let html = '<div class="meta">收到时间: ' + timeStr + '</div>';
+
+      if (offer.textMessage) {
+        const escapedText = offer.textMessage
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+        html += '<div class="text-box">' + escapedText + '</div>';
+        html += '<div style="margin-top:8px;text-align:right;"><button class="btn-outline" data-copy="' + encodeURIComponent(offer.textMessage) + '" onclick="copyReceivedText(this)">复制文本</button></div>';
+      }
+
+      if (Array.isArray(offer.files) && offer.files.length > 0) {
+        for (const f of offer.files) {
+          const dlUrl = '/api/pull-file?sessionId=' + encodeURIComponent(offer.sessionId) +
+            '&fileId=' + encodeURIComponent(f.id) +
+            '&token=' + encodeURIComponent(offer.token);
+          const safeName = (f.relativePath || f.name)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+          html += '<div class="file-row">' +
+            '<span class="file-name">' + safeName + '</span>' +
+            '<span class="file-size">' + formatBytes(f.size || 0) + '</span>' +
+            '<a class="btn" style="padding:6px 12px;font-size:12.5px;" href="' + dlUrl + '" download>下载</a>' +
+            '</div>';
+        }
+      }
+
+      item.innerHTML = html;
+      list.prepend(item);
+    }
+
+    function copyReceivedText(btn) {
+      const text = decodeURIComponent(btn.getAttribute('data-copy') || '');
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      const old = btn.innerText;
+      btn.innerText = '已复制';
+      setTimeout(() => { btn.innerText = old; }, 1500);
+    }
+
     async function sendNow() {
       const fileEl = document.getElementById('fileInput');
       const textEl = document.getElementById('textInput');
@@ -1493,7 +1667,7 @@ class TransferService extends ChangeNotifier {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          sender: { id: 'web-client', alias: 'Web 浏览器', avatar: 'web', deviceType: 'web', os: 'Browser', ip: '0.0.0.0', transferPort: 0 },
+          sender: webPeerProfile,
           files: fileMeta,
           textMessage: text || null
         })
@@ -1513,6 +1687,9 @@ class TransferService extends ChangeNotifier {
       fileEl.value = '';
       status.innerText = '传输已完成';
     }
+
+    pollHeartbeat();
+    setInterval(pollHeartbeat, 2000);
   </script>
 </body>
 </html>

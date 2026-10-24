@@ -391,13 +391,13 @@ class DiscoveryService extends ChangeNotifier {
   /// 当收到 HTTP 握手或主动扫描发现节点时注册到在线列表
   void registerPeer(PeerDevice peer) {
     if (peer.id == _localDevice.id) return;
-    if (peer.transferPort <= 0 || peer.deviceType == DeviceType.web) return;
+    if (peer.id == 'web-client') return;
     final isNew = !_peers.containsKey(peer.id);
     _peers[peer.id] = peer.copyWith(lastSeen: DateTime.now());
     if (isNew) {
       TransferLogger.discovery(
         'HTTP 注册新设备: ${peer.alias} (${peer.os}) '
-        '@ ${peer.ip}:${peer.transferPort} [${peer.shortCode}]',
+        '@ ${peer.endpointLabel} [${peer.shortCode}]',
       );
     }
     notifyListeners();
@@ -416,7 +416,10 @@ class DiscoveryService extends ChangeNotifier {
       unawaited(_probeLocalhostPorts());
     }
     for (final peer in _peers.values.toList()) {
-      // 宿主机不主动轮询模拟器内网 IP 10.0.2.16（由模拟器单向轮询宿主机）
+      // Web 浏览器客户端与模拟器内网节点由其自身单向发起心跳轮询，宿主机不主动发起反向连接
+      if (peer.deviceType == DeviceType.web || peer.transferPort <= 0) {
+        continue;
+      }
       if (!localIsEmulator && peer.ip.startsWith('10.0.2.')) {
         continue;
       }

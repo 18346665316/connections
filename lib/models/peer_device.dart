@@ -37,6 +37,9 @@ class PeerDevice {
     return '#$transferPort';
   }
 
+  String get endpointLabel =>
+      transferPort > 0 ? '$ip:$transferPort' : '$ip · Web';
+
   PeerDevice copyWith({
     String? id,
     String? alias,
