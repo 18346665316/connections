@@ -1486,33 +1486,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 indent: 58,
               ),
               _buildSettingsRow(
-                icon: Icons.lan_outlined,
-                title: '局域网地址',
-                valueText: '${local.ip}:${local.transferPort} (${local.shortCode})',
-                monospaceValue: true,
-                trailing: const Icon(
-                  Icons.copy_rounded,
-                  size: 15,
-                  color: Color(0xFF71717A),
-                ),
-                onTap: () {
-                  final addr = '${local.ip}:${local.transferPort}';
-                  Clipboard.setData(ClipboardData(text: addr));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('已复制本机地址: $addr'),
-                      behavior: SnackBarBehavior.floating,
-                    ),
-                  );
-                },
-              ),
-              const Divider(
-                height: 1,
-                thickness: 1,
-                color: Color(0xFF222226),
-                indent: 58,
-              ),
-              _buildSettingsRow(
                 icon: Icons.qr_code_2_rounded,
                 title: 'Web 扫码访问',
                 subtitle: webUrl,
