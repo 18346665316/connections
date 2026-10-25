@@ -23,23 +23,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final Map<String, BuildContext> _openConfirmDialogContexts = {};
 
   bool _initialized = false;
-  bool _isRefreshingPeers = false;
 
   bool get _isMobilePlatform => Platform.isAndroid || Platform.isIOS;
-
-  Future<void> _handleRefreshPeers() async {
-    if (_isRefreshingPeers) return;
-    setState(() {
-      _isRefreshingPeers = true;
-    });
-    _discoveryService.refreshDiscovery();
-    await Future<void>.delayed(const Duration(milliseconds: 600));
-    if (mounted) {
-      setState(() {
-        _isRefreshingPeers = false;
-      });
-    }
-  }
 
   @override
   void initState() {
@@ -760,37 +745,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _showConnectByCodeDialog() async {
-    final input = await showDialog<String>(
-      context: context,
-      builder: (_) => const _TextInputDialog(
-        title: '指定 IP 或短码连接',
-        description: '输入目标设备的 IP 尾段短码（如 105）或完整地址（如 192.168.1.105:53318）：',
-        hintText: '105 或 192.168.1.105',
-        confirmLabel: '连接',
-        monospace: true,
-      ),
-    );
-    if (input == null || input.trim().isEmpty || !mounted) return;
-    final found = await _discoveryService.connectByCodeOrIp(input.trim());
-    if (!mounted) return;
-    if (found != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('已连接 ${found.alias} (${found.ip})'),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('未能在该地址探测到在线节点'),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    }
-  }
-
   Future<void> _showEditProfileDialog() async {
     final local = _discoveryService.localDevice;
     final newName = await showDialog<String>(
@@ -1017,39 +971,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
               IconButton(
                 visualDensity: VisualDensity.compact,
-                tooltip: '指定 IP 或短码连接',
-                onPressed: _showConnectByCodeDialog,
-                icon: const Icon(
-                  Icons.link_rounded,
-                  size: 18,
-                  color: Color(0xFFA1A1AA),
-                ),
-              ),
-              IconButton(
-                visualDensity: VisualDensity.compact,
-                tooltip: '扫描当前网段',
-                onPressed: _discoveryService.isScanningSubnet
-                    ? null
-                    : () async {
-                        await _discoveryService.scanSubnet();
-                      },
-                icon: _discoveryService.isScanningSubnet
-                    ? const SizedBox(
-                        width: 15,
-                        height: 15,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 1.8,
-                          color: Color(0xFFA1A1AA),
-                        ),
-                      )
-                    : const Icon(
-                        Icons.radar_rounded,
-                        size: 18,
-                        color: Color(0xFFA1A1AA),
-                      ),
-              ),
-              IconButton(
-                visualDensity: VisualDensity.compact,
                 tooltip: '设置',
                 onPressed: _openSettingsPage,
                 icon: const Icon(
@@ -1210,20 +1131,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Widget _buildOnlinePeersGroup(List<PeerDevice> peers) {
+    final isScanning = _discoveryService.isScanningSubnet;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildGroupHeader(
           title: '在线设备 (${peers.length})',
           trailing: InkWell(
-            onTap: _isRefreshingPeers ? null : _handleRefreshPeers,
+            onTap: isScanning ? null : () => _discoveryService.scanSubnet(),
             borderRadius: BorderRadius.circular(4),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (_isRefreshingPeers) ...[
+                  if (isScanning) ...[
                     const SizedBox(
                       width: 10,
                       height: 10,
@@ -1235,9 +1157,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     const SizedBox(width: 5),
                   ],
                   Text(
-                    _isRefreshingPeers ? '刷新中' : '刷新',
+                    isScanning ? '刷新中' : '刷新',
                     style: TextStyle(
-                      color: _isRefreshingPeers
+                      color: isScanning
                           ? const Color(0xFF71717A)
                           : const Color(0xFF3B82F6),
                       fontSize: 12,
@@ -1257,7 +1179,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           clipBehavior: Clip.antiAlias,
           child: peers.isEmpty
               ? InkWell(
-                  onTap: _discoveryService.isScanningSubnet
+                  onTap: isScanning
                       ? null
                       : () => _discoveryService.scanSubnet(),
                   child: Padding(
@@ -1297,7 +1219,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               ),
                               SizedBox(height: 2),
                               Text(
-                                '点击扫描当前局域网子网，或通过右上角指定 IP 连接',
+                                '点击重新扫描，或通过右上角 Web 扫码互传',
                                 style: TextStyle(
                                   color: Color(0xFF71717A),
                                   fontSize: 12,
@@ -1307,9 +1229,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                         const SizedBox(width: 8),
-                        const Text(
-                          '扫描',
-                          style: TextStyle(
+                        Text(
+                          isScanning ? '扫描中' : '扫描',
+                          style: const TextStyle(
                             color: Color(0xFF3B82F6),
                             fontSize: 13,
                           ),
@@ -2495,24 +2417,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
 class _TextInputDialog extends StatefulWidget {
   final String title;
-  final String? description;
   final String? labelText;
   final String? hintText;
   final String initialValue;
   final String confirmLabel;
   final int maxLines;
-  final bool monospace;
   final bool showPasteButton;
 
   const _TextInputDialog({
     required this.title,
-    this.description,
     this.labelText,
     this.hintText,
     this.initialValue = '',
     required this.confirmLabel,
     this.maxLines = 1,
-    this.monospace = false,
     this.showPasteButton = false,
   });
 
@@ -2560,25 +2478,14 @@ class _TextInputDialogState extends State<_TextInputDialog> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (widget.description != null) ...[
-                Text(
-                  widget.description!,
-                  style: const TextStyle(
-                    color: Color(0xFFA1A1AA),
-                    fontSize: 12.5,
-                  ),
-                ),
-                const SizedBox(height: 12),
-              ],
               TextField(
                 controller: _controller,
                 maxLines: widget.maxLines,
                 autofocus: true,
                 onSubmitted: widget.maxLines == 1 ? (_) => _submit() : null,
-                style: TextStyle(
-                  color: const Color(0xFFF4F4F5),
+                style: const TextStyle(
+                  color: Color(0xFFF4F4F5),
                   fontSize: 13.5,
-                  fontFamily: widget.monospace ? 'monospace' : null,
                 ),
                 decoration: InputDecoration(
                   labelText: widget.labelText,
