@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
@@ -36,11 +37,13 @@ class _ActiveFileReceiveContext {
   final File partFile;
   final int initialOffset;
   final Stopwatch fileStopwatch = Stopwatch()..start();
-  RandomAccessFile? _raf;
-  Future<void> _ioChain = Future<void>.value();
   final Map<int, ({int currentEnd, int targetEnd})> _segments = {};
+  final Map<int, int> _completedSegments = {};
+  final Map<int, int> _maxSegmentReach = {};
+  final Set<RandomAccessFile> _activeLocalHandles = {};
   int contiguousBytes;
-  int bytesSinceLastFlush = 0;
+  int completedContiguousBytes;
+  bool startLogged = false;
   bool isFinalized = false;
   bool isAborted = false;
 
@@ -49,16 +52,21 @@ class _ActiveFileReceiveContext {
     required this.finalFile,
     required this.partFile,
     required this.initialOffset,
-  }) : contiguousBytes = initialOffset;
+  })  : contiguousBytes = initialOffset,
+        completedContiguousBytes = initialOffset;
 
-  Future<void> ensureOpen() {
-    return _enqueueIo(() async {
-      if (_raf != null || isAborted || isFinalized) return;
-      _raf = await partFile.open(mode: FileMode.append);
-      if (initialOffset == 0 && await _raf!.length() > 0) {
-        await _raf!.truncate(0);
+  /// 在握手阶段预先创建或重置 .part 文件，使后续多路并发分片可各自持独立句柄无锁写入
+  void preparePartFileSync() {
+    if (isAborted || isFinalized) return;
+    if (initialOffset == 0) {
+      if (partFile.existsSync()) {
+        partFile.writeAsBytesSync(const [], flush: false);
+      } else {
+        partFile.createSync(recursive: true);
       }
-    });
+    } else if (!partFile.existsSync()) {
+      partFile.createSync(recursive: true);
+    }
   }
 
   void registerSegment(int sliceStart, int sliceEnd) {
@@ -66,38 +74,44 @@ class _ActiveFileReceiveContext {
       sliceStart,
       () => (currentEnd: sliceStart, targetEnd: sliceEnd),
     );
+    _maxSegmentReach.putIfAbsent(sliceStart, () => sliceStart);
   }
 
-  Future<void> writeChunk({
-    required int sliceStart,
-    required int sliceEnd,
-    required int writeOffset,
-    required List<int> bytes,
-    required int flushThresholdBytes,
-  }) {
-    return _enqueueIo(() async {
-      if (isAborted || isFinalized) {
-        throw const SocketException('文件接收上下文已关闭');
-      }
-      final raf = _raf ??= await partFile.open(mode: FileMode.append);
-      await raf.setPosition(writeOffset);
-      await raf.writeFrom(bytes);
+  /// 更新分片进度并返回本次新增的不重复有效字节数（自动去重分片断线重传的前缀数据）
+  int updateSegmentProgress(
+    int sliceStart,
+    int sliceEnd,
+    int currentEnd,
+  ) {
+    if (isAborted || isFinalized) return 0;
+    final clampedEnd = currentEnd.clamp(sliceStart, sliceEnd);
+    final prevReach = _maxSegmentReach[sliceStart] ?? sliceStart;
+    final netNewBytes = max(0, clampedEnd - prevReach);
+    if (clampedEnd > prevReach) {
+      _maxSegmentReach[sliceStart] = clampedEnd;
+    }
 
-      final newEnd = writeOffset + bytes.length;
-      final existing = _segments[sliceStart];
-      final prevEnd = existing?.currentEnd ?? sliceStart;
-      _segments[sliceStart] = (
-        currentEnd: max(prevEnd, newEnd),
-        targetEnd: sliceEnd,
-      );
-      _advanceContiguousFrontier();
+    final existing = _segments[sliceStart];
+    final prevEnd = existing?.currentEnd ?? sliceStart;
+    _segments[sliceStart] = (
+      currentEnd: max(prevEnd, clampedEnd),
+      targetEnd: sliceEnd,
+    );
+    _advanceContiguousFrontier();
+    return netNewBytes;
+  }
 
-      bytesSinceLastFlush += bytes.length;
-      if (bytesSinceLastFlush >= flushThresholdBytes) {
-        bytesSinceLastFlush = 0;
-        await raf.flush();
-      }
-    });
+  /// 标记分片完成并返回剩余尚未计入的不重复字节数
+  int markSegmentCompleted(
+    int sliceStart,
+    int sliceEnd,
+  ) {
+    if (isAborted || isFinalized) return 0;
+    final netNewBytes = updateSegmentProgress(sliceStart, sliceEnd, sliceEnd);
+    final prevCompletedEnd = _completedSegments[sliceStart] ?? sliceStart;
+    _completedSegments[sliceStart] = max(prevCompletedEnd, sliceEnd);
+    _advanceCompletedFrontier();
+    return netNewBytes;
   }
 
   void _advanceContiguousFrontier() {
@@ -118,61 +132,488 @@ class _ActiveFileReceiveContext {
     }
   }
 
-  Future<File?> tryFinalize(File Function() resolveFallbackFinal) {
-    return _enqueueIo<File?>(() async {
-      if (isFinalized || isAborted) return null;
-      if (contiguousBytes < fileItem.size) return null;
-      isFinalized = true;
-      if (_raf != null) {
-        await _raf!.flush();
-        await _raf!.close();
-        _raf = null;
+  void _advanceCompletedFrontier() {
+    final starts = _completedSegments.keys.toList()..sort();
+    for (final start in starts) {
+      final end = _completedSegments[start]!;
+      if (start <= completedContiguousBytes) {
+        if (end > completedContiguousBytes) {
+          completedContiguousBytes = end;
+        }
+        if (end <= completedContiguousBytes) {
+          _completedSegments.remove(start);
+        }
+      } else {
+        break;
       }
-      final resolvedFinal =
-          finalFile.existsSync() ? resolveFallbackFinal() : finalFile;
-      await partFile.rename(resolvedFinal.path);
-      return resolvedFinal;
-    });
+    }
   }
 
-  Future<void> abort({required bool deletePartFile}) {
-    return _enqueueIo(() async {
-      if (isFinalized || isAborted) return;
-      isAborted = true;
-      if (_raf != null) {
-        try {
-          if (!deletePartFile && contiguousBytes > 0) {
-            await _raf!.truncate(contiguousBytes);
-            await _raf!.flush();
-          }
-        } catch (_) {}
-        try {
-          await _raf!.close();
-        } catch (_) {}
-        _raf = null;
-      }
-      if (deletePartFile || contiguousBytes <= 0) {
-        try {
-          if (partFile.existsSync()) {
-            partFile.deleteSync();
-          }
-        } catch (_) {}
-      }
-    });
+  Future<File?> tryFinalize(File Function() resolveFallbackFinal) async {
+    if (isFinalized || isAborted) return null;
+    if (completedContiguousBytes < fileItem.size) return null;
+    isFinalized = true;
+    final resolvedFinal =
+        finalFile.existsSync() ? resolveFallbackFinal() : finalFile;
+    await partFile.rename(resolvedFinal.path);
+    return resolvedFinal;
   }
 
-  Future<T> _enqueueIo<T>(Future<T> Function() action) {
-    final completer = Completer<T>();
-    _ioChain = _ioChain.then((_) async {
+  Future<void> abort({required bool deletePartFile}) async {
+    if (isFinalized || isAborted) return;
+    isAborted = true;
+    final handles = _activeLocalHandles.toList();
+    _activeLocalHandles.clear();
+    for (final raf in handles) {
       try {
-        final res = await action();
-        completer.complete(res);
-      } catch (e, st) {
-        completer.completeError(e, st);
-      }
-    });
-    return completer.future;
+        await raf.close();
+      } catch (_) {}
+    }
+    if (!deletePartFile && contiguousBytes > 0) {
+      try {
+        if (partFile.existsSync()) {
+          final raf = await partFile.open(mode: FileMode.append);
+          try {
+            await raf.truncate(contiguousBytes);
+          } finally {
+            await raf.close();
+          }
+        }
+      } catch (_) {}
+    } else if (deletePartFile || contiguousBytes <= 0) {
+      try {
+        if (partFile.existsSync()) {
+          partFile.deleteSync();
+        }
+      } catch (_) {}
+    }
   }
+}
+
+/// 独立后台接收 Isolate 入口：监听高速数据端口，每个分片持独立文件句柄无锁落盘，与 UI 线程彻底隔离
+Future<void> _dataServerIsolateEntry(Map<String, dynamic> initMsg) async {
+  final readyPort = initMsg['readyPort'] as SendPort;
+  final mainSendPort = initMsg['mainSendPort'] as SendPort;
+  final requestedPort = initMsg['dataPort'] as int;
+  const int diskWriteBufferBytes = 4 * 1024 * 1024;
+  const int maxPendingWriteBytes = 16 * 1024 * 1024;
+
+  final server = await HttpServer.bind(
+    InternetAddress.anyIPv4,
+    requestedPort,
+    shared: true,
+  );
+  server.autoCompress = false;
+
+  final authorizedSessions = <String, Map<String, dynamic>>{};
+  final cancelledSessions = <String>{};
+  final activeSessionRafs = <String, Set<RandomAccessFile>>{};
+
+  final cmdPort = ReceivePort();
+  cmdPort.listen((dynamic message) async {
+    if (message is! Map) return;
+    final cmd = message['cmd'] as String?;
+    if (cmd == 'registerSession') {
+      final sessionId = message['sessionId'] as String;
+      cancelledSessions.remove(sessionId);
+      authorizedSessions[sessionId] = Map<String, dynamic>.from(message);
+      final ackPort = message['ackPort'] as SendPort?;
+      ackPort?.send(true);
+    } else if (cmd == 'cancelSession' || cmd == 'removeSession') {
+      final sessionId = message['sessionId'] as String;
+      if (cmd == 'cancelSession') {
+        cancelledSessions.add(sessionId);
+      }
+      authorizedSessions.remove(sessionId);
+      final rafs = activeSessionRafs.remove(sessionId);
+      if (rafs != null) {
+        for (final r in rafs.toList()) {
+          try {
+            await r.close();
+          } catch (_) {}
+        }
+      }
+    } else if (cmd == 'shutdown') {
+      cmdPort.close();
+      for (final rafSet in activeSessionRafs.values) {
+        for (final r in rafSet.toList()) {
+          try {
+            await r.close();
+          } catch (_) {}
+        }
+      }
+      activeSessionRafs.clear();
+      await server.close(force: true);
+    }
+  });
+
+  server.listen((HttpRequest request) async {
+    request.response.headers.set('Access-Control-Allow-Origin', '*');
+    request.response.headers
+        .set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    request.response.headers.set(
+      'Access-Control-Allow-Headers',
+      'Content-Type, X-Peer-Info, X-Upload-Token',
+    );
+    request.response.headers.set('Access-Control-Max-Age', '86400');
+
+    if (request.method == 'OPTIONS') {
+      request.response.statusCode = HttpStatus.noContent;
+      await request.response.close();
+      return;
+    }
+
+    if (request.uri.path != '/api/upload' || request.method != 'POST') {
+      request.response.statusCode = HttpStatus.notFound;
+      await request.response.close();
+      return;
+    }
+
+    final sessionId = request.uri.queryParameters['sessionId'] ?? '';
+    final fileId = request.uri.queryParameters['fileId'] ?? '';
+    final token = request.headers.value('X-Upload-Token') ??
+        request.uri.queryParameters['token'] ??
+        '';
+
+    final sessionMeta = authorizedSessions[sessionId];
+    if (sessionMeta == null ||
+        cancelledSessions.contains(sessionId) ||
+        sessionMeta['token'] != token) {
+      await request.drain<void>();
+      request.response.statusCode = HttpStatus.unauthorized;
+      request.response.write('{"error":"Unauthorized"}');
+      await request.response.close();
+      return;
+    }
+
+    final filesMap = sessionMeta['files'] as Map?;
+    final rawFileMeta = filesMap?[fileId] as Map?;
+    if (rawFileMeta == null) {
+      await request.drain<void>();
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('{"error":"Invalid fileId"}');
+      await request.response.close();
+      return;
+    }
+
+    final partPath = rawFileMeta['partPath'] as String;
+    final fileSize =
+        (rawFileMeta['expectedSize'] as int?) ?? (rawFileMeta['size'] as int);
+    final initialOffset = rawFileMeta['initialOffset'] as int;
+
+    final rawOffset = request.uri.queryParameters['offset'];
+    final rawLength = request.uri.queryParameters['length'];
+    final sliceStart =
+        rawOffset != null ? (int.tryParse(rawOffset) ?? 0) : initialOffset;
+    final sliceLength = rawLength != null
+        ? (int.tryParse(rawLength) ?? max(0, fileSize - sliceStart))
+        : max(0, fileSize - sliceStart);
+    final sliceEnd = sliceStart + sliceLength;
+
+    if (sliceStart < 0 ||
+        sliceLength < 0 ||
+        (fileSize > 0 && sliceEnd > fileSize)) {
+      await request.drain<void>();
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('{"error":"Slice out of range"}');
+      await request.response.close();
+      return;
+    }
+
+    mainSendPort.send({
+      'type': 'sliceStart',
+      'sessionId': sessionId,
+      'fileId': fileId,
+      'sliceStart': sliceStart,
+      'sliceEnd': sliceEnd,
+    });
+
+    RandomAccessFile? sliceRaf;
+    Future<void> sliceIoChain = Future<void>.value();
+    int pendingWriteBytes = 0;
+    Object? lastWriteError;
+    final writeBuffer = BytesBuilder(copy: false);
+    int writeCursor = sliceStart;
+    int bytesInSlice = 0;
+    int unreportedBytes = 0;
+    final reportSw = Stopwatch()..start();
+    int lastReportMs = 0;
+
+    Future<void> enqueueSliceWrite(Uint8List bytesToWrite) {
+      pendingWriteBytes += bytesToWrite.length;
+      final completer = Completer<void>();
+      sliceIoChain = sliceIoChain.then((_) async {
+        try {
+          if (cancelledSessions.contains(sessionId)) {
+            throw const SocketException('用户已取消接收');
+          }
+          await sliceRaf!.writeFrom(bytesToWrite);
+          completer.complete();
+        } catch (e, st) {
+          lastWriteError ??= e;
+          completer.completeError(e, st);
+        } finally {
+          pendingWriteBytes = max(0, pendingWriteBytes - bytesToWrite.length);
+        }
+      });
+      return completer.future;
+    }
+
+    try {
+      request.response.bufferOutput = false;
+      sliceRaf = await File(partPath).open(mode: FileMode.append);
+      activeSessionRafs.putIfAbsent(sessionId, () => {}).add(sliceRaf);
+      if (sliceLength > 0) {
+        await sliceRaf.setPosition(sliceStart);
+      }
+
+      await for (final chunk in request) {
+        if (cancelledSessions.contains(sessionId)) {
+          throw const SocketException('用户已取消接收');
+        }
+        if (lastWriteError != null) {
+          throw lastWriteError!;
+        }
+        bytesInSlice += chunk.length;
+        unreportedBytes += chunk.length;
+        if (fileSize > 0 && bytesInSlice > sliceLength) {
+          throw const HttpException('接收字节数超出声明的分片大小');
+        }
+        writeBuffer.add(chunk);
+        if (writeBuffer.length >= diskWriteBufferBytes) {
+          final bytesToWrite = writeBuffer.takeBytes();
+          writeCursor += bytesToWrite.length;
+          final wf = enqueueSliceWrite(bytesToWrite);
+          if (pendingWriteBytes >= maxPendingWriteBytes) {
+            await wf;
+          } else {
+            unawaited(wf.catchError((Object _) {}));
+          }
+        }
+
+        final nowMs = reportSw.elapsedMilliseconds;
+        if (unreportedBytes >= 2 * 1024 * 1024 || nowMs - lastReportMs >= 80) {
+          lastReportMs = nowMs;
+          mainSendPort.send({
+            'type': 'progress',
+            'sessionId': sessionId,
+            'fileId': fileId,
+            'sliceStart': sliceStart,
+            'sliceEnd': sliceEnd,
+            'writeEnd': writeCursor,
+            'receivedEnd': sliceStart + bytesInSlice,
+            'deltaBytes': unreportedBytes,
+          });
+          unreportedBytes = 0;
+        }
+      }
+
+      if (writeBuffer.isNotEmpty) {
+        final bytesToWrite = writeBuffer.takeBytes();
+        writeCursor += bytesToWrite.length;
+        await enqueueSliceWrite(bytesToWrite);
+      }
+      await sliceIoChain;
+      if (lastWriteError != null) {
+        throw lastWriteError!;
+      }
+
+      activeSessionRafs[sessionId]?.remove(sliceRaf);
+      await sliceRaf.close();
+      sliceRaf = null;
+
+      if (fileSize > 0 && bytesInSlice != sliceLength) {
+        throw HttpException(
+          '分片完整性校验失败：预期 $sliceLength B，实际接收 $bytesInSlice B',
+        );
+      }
+
+      final replyPort = ReceivePort();
+      mainSendPort.send({
+        'type': 'sliceComplete',
+        'sessionId': sessionId,
+        'fileId': fileId,
+        'sliceStart': sliceStart,
+        'sliceEnd': sliceEnd,
+        'remainingDeltaBytes': unreportedBytes,
+        'replyPort': replyPort.sendPort,
+      });
+      unreportedBytes = 0;
+
+      final reply = await replyPort.first.timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => <String, dynamic>{'ok': true},
+      );
+      replyPort.close();
+
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode(reply));
+      await request.response.close();
+    } catch (e) {
+      if (sliceRaf != null &&
+          !cancelledSessions.contains(sessionId) &&
+          writeBuffer.isNotEmpty) {
+        try {
+          final remainingBytes = writeBuffer.takeBytes();
+          writeCursor += remainingBytes.length;
+          await enqueueSliceWrite(remainingBytes);
+          await sliceIoChain;
+        } catch (_) {}
+      }
+      if (sliceRaf != null) {
+        activeSessionRafs[sessionId]?.remove(sliceRaf);
+        try {
+          await sliceIoChain;
+        } catch (_) {}
+        try {
+          await sliceRaf.close();
+        } catch (_) {}
+        sliceRaf = null;
+      }
+      if (writeCursor > sliceStart) {
+        mainSendPort.send({
+          'type': 'progress',
+          'sessionId': sessionId,
+          'fileId': fileId,
+          'sliceStart': sliceStart,
+          'sliceEnd': sliceEnd,
+          'writeEnd': writeCursor,
+          'receivedEnd': writeCursor,
+          'deltaBytes': unreportedBytes,
+        });
+      }
+      mainSendPort.send({
+        'type': 'sliceError',
+        'sessionId': sessionId,
+        'fileId': fileId,
+        'sliceStart': sliceStart,
+        'sliceEnd': sliceEnd,
+        'cancelled': cancelledSessions.contains(sessionId),
+        'error': e.toString(),
+      });
+      try {
+        request.response.statusCode = HttpStatus.internalServerError;
+        request.response.write(jsonEncode({'error': e.toString()}));
+        await request.response.close();
+      } catch (_) {}
+    }
+  });
+
+  readyPort.send({
+    'cmdPort': cmdPort.sendPort,
+    'boundPort': server.port,
+  });
+}
+
+/// 独立后台发送 Isolate 入口：持独立文件句柄与 Keep-Alive 连接发送 64MB 大分块，具备分块级指数退避自动重传
+Future<void> _senderWorkerIsolateEntry(SendPort mainInitPort) async {
+  final cmdPort = ReceivePort();
+  final client = HttpClient()
+    ..findProxy = null
+    ..connectionTimeout = const Duration(seconds: 4)
+    ..idleTimeout = const Duration(seconds: 30)
+    ..maxConnectionsPerHost = 4
+    ..autoUncompress = false;
+  const int readChunkBytes = 2 * 1024 * 1024;
+  const int maxAttempts = 4;
+
+  cmdPort.listen((dynamic message) async {
+    if (message is! Map) return;
+    final cmd = message['cmd'] as String?;
+    if (cmd == 'shutdown') {
+      cmdPort.close();
+      client.close(force: true);
+      return;
+    }
+    if (cmd != 'uploadSlice') return;
+
+    final replyPort = message['replyPort'] as SendPort;
+    final url = message['url'] as String;
+    final token = message['token'] as String;
+    final localPath = message['localPath'] as String;
+    final offset = message['offset'] as int;
+    final length = message['length'] as int;
+
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+      int sentInAttempt = 0;
+
+      Stream<List<int>> openSliceStream() async* {
+        final raf = await File(localPath).open(mode: FileMode.read);
+        try {
+          if (offset > 0) {
+            await raf.setPosition(offset);
+          }
+          int remaining = length;
+          if (remaining <= 0) return;
+
+          int currentReadSize = min(readChunkBytes, remaining);
+          remaining -= currentReadSize;
+          Future<Uint8List> pendingRead = raf.read(currentReadSize);
+
+          while (true) {
+            final chunk = await pendingRead;
+            if (chunk.isEmpty) break;
+
+            Future<Uint8List>? nextRead;
+            if (remaining > 0 && chunk.length == currentReadSize) {
+              final nextSize = min(readChunkBytes, remaining);
+              remaining -= nextSize;
+              currentReadSize = nextSize;
+              nextRead = raf.read(nextSize);
+            }
+
+            sentInAttempt += chunk.length;
+            replyPort.send({'type': 'progress', 'delta': chunk.length});
+            yield chunk;
+
+            if (nextRead == null) break;
+            pendingRead = nextRead;
+          }
+        } finally {
+          try {
+            await raf.close();
+          } catch (_) {}
+        }
+      }
+
+      try {
+        final uploadReq = await client.postUrl(Uri.parse(url));
+        uploadReq.bufferOutput = false;
+        uploadReq.headers.contentType = ContentType.binary;
+        uploadReq.headers.set('X-Upload-Token', token);
+        uploadReq.contentLength = length;
+
+        await uploadReq.addStream(openSliceStream());
+        final uploadResp = await uploadReq.close();
+        await uploadResp.drain<void>();
+        if (uploadResp.statusCode == HttpStatus.ok) {
+          replyPort.send({'type': 'done', 'delta': 0});
+          return;
+        }
+        if (uploadResp.statusCode == HttpStatus.unauthorized ||
+            uploadResp.statusCode == HttpStatus.forbidden) {
+          replyPort.send({
+            'type': 'error',
+            'error': '分片上传鉴权失败或已取消 (${uploadResp.statusCode})',
+          });
+          return;
+        }
+        throw HttpException('HTTP ${uploadResp.statusCode}');
+      } catch (e) {
+        if (sentInAttempt > 0) {
+          // 回滚本次失败尝试已上报的临时进度，准备重试该分块
+          replyPort.send({'type': 'progress', 'delta': -sentInAttempt});
+        }
+        if (attempt >= maxAttempts) {
+          replyPort.send({'type': 'error', 'error': e.toString()});
+          return;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
+      }
+    }
+  });
+
+  mainInitPort.send(cmdPort.sendPort);
 }
 
 class _OutboundPullContext {
@@ -198,15 +639,22 @@ class _OutboundPullContext {
 
 class TransferService extends ChangeNotifier {
   static const int _maxControlBodyBytes = 1024 * 1024; // 1 MB 控制信令上限
-  static const int _sendChunkCoalesceBytes = 512 * 1024; // 512 KB 发送聚合块
-  static const int _diskWriteBufferBytes = 1024 * 1024; // 1 MB 磁盘顺序写聚合块
-  static const int _flushBackpressureBytes = 8 * 1024 * 1024; // 8 MB 背压刷盘阈值
-  static const int _parallelSegmentSizeBytes = 16 * 1024 * 1024; // 16 MB 大文件多路并发分片大小
+  static const int _fileReadChunkBytes = 2 * 1024 * 1024; // 2 MB 顺序磁盘读取与网络发送块
+  static const int _diskWriteBufferBytes = 4 * 1024 * 1024; // 4 MB 接收端磁盘顺序写聚合块
+  static const int _maxPendingWriteBytes = 16 * 1024 * 1024; // 16 MB 异步落盘队列背压上限
+  static const int _parallelSegmentSizeBytes =
+      64 * 1024 * 1024; // 64 MB 大分块交替流水线（小文件自动单流顺序直传，超大文件双流填满高 RTT 带宽时延积）
+  static const int _maxParallelUploadStreams = 2; // 最多 2 路并发流，兼顾 BDP 吞吐与无线队列稳定性
+  static const int _dataIsolateCount = 4; // 4 个独立后台数据接收 Isolate 池
   static const int _uiNotifyIntervalMs = 150; // 150ms UI 进度节流间隔
 
   final DiscoveryService discoveryService;
   HttpServer? _server;
   int _boundPort = DiscoveryService.defaultTransferPort;
+  int _dataPort = 0;
+  ReceivePort? _dataEngineReceivePort;
+  final List<Isolate> _dataIsolates = [];
+  final List<SendPort> _dataIsolateSendPorts = [];
   bool _autoAccept = false;
   late String _saveDirectoryPath;
   final Set<String> _trustedPeerIds = {};
@@ -224,9 +672,14 @@ class TransferService extends ChangeNotifier {
   final Map<String, Stopwatch> _receivingSessionStopwatches = {};
   final Map<String, int> _receivingSessionLastNotifyMs = {};
   final Map<String, int> _receivingSessionLastLogMs = {};
+  final Map<String, int> _receivingSessionWindowStartMs = {};
+  final Map<String, int> _receivingSessionWindowStartBytes = {};
   final Map<String, String> _sessionTokens = {};
+  final Map<String, Timer> _sessionRetryGraceTimers = {};
   final Map<String, Completer<bool>> _pendingConfirmations = {};
   final Map<String, HttpClient> _activeSendingClients = {};
+  final Map<String, List<Isolate>> _activeSendingIsolates = {};
+  final Map<String, Completer<void>> _sessionCancelCompleters = {};
   final Map<String, ({String ip, int port, String remoteSessionId})>
       _activeSendingRemotes = {};
   final Map<String, _OutboundPullContext> _outboundPullSessions = {};
@@ -234,13 +687,21 @@ class TransferService extends ChangeNotifier {
   final Set<String> _cancelledSessionIds = {};
 
   int get boundPort => _boundPort;
+  int get dataPort => _dataPort > 0 ? _dataPort : _boundPort;
   bool get autoAccept => _autoAccept;
   String get saveDirectoryPath => _saveDirectoryPath;
   int get trustedPeerCount => _trustedPeerIds.length;
   List<TransferSession> get sessions => List.unmodifiable(_sessions);
 
+  /// 是否存在正在进行的活跃数据传输（用于在传输期间自动静默 UDP 广播与后台轮询，把信道 100% 让给数据流）
+  bool get hasActiveDataTransfer =>
+      _activeReceivingSessions.isNotEmpty ||
+      _activeSendingClients.isNotEmpty ||
+      _sessions.any((s) => s.status == TransferStatus.transferring);
+
   TransferService({required this.discoveryService}) {
     discoveryService.onPullOffersReceived = _handleIncomingPullOffers;
+    discoveryService.isTransferBusy = () => hasActiveDataTransfer;
     final persisted = SettingsService.load();
     _autoAccept = persisted.autoAccept;
     _trustedPeerIds.addAll(persisted.trustedPeerIds);
@@ -439,11 +900,411 @@ class TransferService extends ChangeNotifier {
       TransferLogger.error('Server', 'HTTP P2P 服务异常: $e');
     });
 
+    await _startDataIsolatePool();
+
     TransferLogger.recv(
-      'P2P 传输服务已监听端口: $_boundPort | 默认接收目录: $_saveDirectoryPath',
+      'P2P 传输服务已监听信令端口: $_boundPort | 高速数据流端口: $_dataPort '
+      '(${_dataIsolateSendPorts.length} 核后台 Isolate 池) | 默认接收目录: $_saveDirectoryPath',
     );
     notifyListeners();
     return _boundPort;
+  }
+
+  /// 启动 4 核后台数据接收 Isolate 池（共享 _dataPort 端口，彻底隔离高频网络收包、磁盘 I/O 与 UI 渲染线程）
+  Future<void> _startDataIsolatePool() async {
+    try {
+      int candidatePort = 0;
+      for (int p = _boundPort + 100; p <= _boundPort + 120; p++) {
+        try {
+          final probe = await HttpServer.bind(
+            InternetAddress.anyIPv4,
+            p,
+            shared: true,
+          );
+          candidatePort = probe.port;
+          await probe.close(force: true);
+          break;
+        } catch (_) {
+          continue;
+        }
+      }
+      if (candidatePort == 0) {
+        final probe = await HttpServer.bind(
+          InternetAddress.anyIPv4,
+          0,
+          shared: true,
+        );
+        candidatePort = probe.port;
+        await probe.close(force: true);
+      }
+
+      _dataEngineReceivePort?.close();
+      final enginePort = ReceivePort();
+      _dataEngineReceivePort = enginePort;
+      enginePort.listen(_handleDataIsolateMessage);
+
+      _dataIsolates.clear();
+      _dataIsolateSendPorts.clear();
+
+      for (int i = 0; i < _dataIsolateCount; i++) {
+        final readyPort = ReceivePort();
+        final isolate = await Isolate.spawn(
+          _dataServerIsolateEntry,
+          <String, dynamic>{
+            'readyPort': readyPort.sendPort,
+            'mainSendPort': enginePort.sendPort,
+            'dataPort': candidatePort,
+          },
+          debugName: 'TransferDataIsolate-$i',
+        );
+        final readyMsg = await readyPort.first as Map<dynamic, dynamic>;
+        readyPort.close();
+        _dataIsolates.add(isolate);
+        _dataIsolateSendPorts.add(readyMsg['cmdPort'] as SendPort);
+      }
+      _dataPort = candidatePort;
+    } catch (e) {
+      TransferLogger.error('Server', '后台数据 Isolate 池启动降级，回退至主端口: $e');
+      _dataPort = _boundPort;
+    }
+  }
+
+  void _handleDataIsolateMessage(dynamic raw) {
+    if (raw is! Map) return;
+    final type = raw['type'] as String? ?? '';
+    final sessionId = raw['sessionId'] as String? ?? '';
+    final fileId = raw['fileId'] as String? ?? '';
+
+    if (_cancelledSessionIds.contains(sessionId)) return;
+    final session = _activeReceivingSessions[sessionId];
+    final sessionFilesMap = _sessionFileContexts[sessionId];
+    if (session == null || sessionFilesMap == null) return;
+    final fileCtx = sessionFilesMap[fileId];
+    if (fileCtx == null) return;
+    final fileItem = fileCtx.fileItem;
+
+    if (type == 'sliceStart') {
+      final sliceStart = raw['sliceStart'] as int? ?? 0;
+      final sliceEnd = raw['sliceEnd'] as int? ?? 0;
+      _sessionRetryGraceTimers.remove('$sessionId:$fileId:$sliceStart')?.cancel();
+      fileCtx.registerSegment(sliceStart, sliceEnd);
+      final sessionStopwatch =
+          _receivingSessionStopwatches[sessionId] ?? fileCtx.fileStopwatch;
+      if (!sessionStopwatch.isRunning) {
+        sessionStopwatch.start();
+      }
+      if (!fileCtx.fileStopwatch.isRunning) {
+        fileCtx.fileStopwatch.start();
+      }
+      if (sliceStart == fileCtx.initialOffset && !fileCtx.startLogged) {
+        fileCtx.startLogged = true;
+        TransferLogger.recv(
+          '开始接收文件 [$sessionId] -> ${fileItem.relativePath ?? fileItem.name} '
+          '(${TransferSession.formatBytes(fileItem.size)}'
+          '${fileCtx.initialOffset > 0 ? ", 续传起点: ${TransferSession.formatBytes(fileCtx.initialOffset)}" : ""})',
+        );
+      }
+    } else if (type == 'progress') {
+      final sliceStart = raw['sliceStart'] as int? ?? 0;
+      final sliceEnd = raw['sliceEnd'] as int? ?? 0;
+      _sessionRetryGraceTimers.remove('$sessionId:$fileId:$sliceStart')?.cancel();
+      final writeEnd = raw['writeEnd'] as int? ?? sliceStart;
+      final receivedEnd = raw['receivedEnd'] as int? ?? writeEnd;
+
+      final netNewBytes = fileCtx.updateSegmentProgress(
+        sliceStart,
+        sliceEnd,
+        receivedEnd,
+      );
+      if (netNewBytes > 0) {
+        session.transferredBytes = min(
+          session.totalBytes,
+          session.transferredBytes + netNewBytes,
+        );
+      }
+      _updateReceivingProgressAndSpeed(sessionId, session, fileCtx);
+    } else if (type == 'sliceComplete') {
+      final sliceStart = raw['sliceStart'] as int? ?? 0;
+      final sliceEnd = raw['sliceEnd'] as int? ?? 0;
+      _sessionRetryGraceTimers.remove('$sessionId:$fileId:$sliceStart')?.cancel();
+      final replyPort = raw['replyPort'] as SendPort?;
+
+      final netNewBytes = fileCtx.markSegmentCompleted(sliceStart, sliceEnd);
+      if (netNewBytes > 0) {
+        session.transferredBytes = min(
+          session.totalBytes,
+          session.transferredBytes + netNewBytes,
+        );
+      }
+      _updateReceivingProgressAndSpeed(sessionId, session, fileCtx);
+
+      unawaited(
+        _finalizeSliceAndRespond(
+          sessionId: sessionId,
+          session: session,
+          fileCtx: fileCtx,
+          replyPort: replyPort,
+        ),
+      );
+    } else if (type == 'sliceError') {
+      final sliceStart = raw['sliceStart'] as int? ?? 0;
+      final sliceTimerKey = '$sessionId:$fileId:$sliceStart';
+      final errorMsg = raw['error'] as String? ?? '接收分片异常';
+      final isCancelled =
+          (raw['cancelled'] as bool? ?? false) ||
+          _cancelledSessionIds.contains(sessionId);
+      if (isCancelled) {
+        unawaited(_failReceivingSession(sessionId, session, fileCtx, errorMsg));
+      } else {
+        // 保留 8 秒宽限期等待发送端自动指数退避重传该分块，避免单次 Socket 闪断直接销毁整个会话
+        TransferLogger.recv(
+          '分片接收闪断 [$sessionId] (${fileItem.name} @ $sliceStart)，等待发送方自动重传: $errorMsg',
+        );
+        _sessionRetryGraceTimers[sliceTimerKey]?.cancel();
+        _sessionRetryGraceTimers[sliceTimerKey] = Timer(
+          const Duration(seconds: 8),
+          () {
+            _sessionRetryGraceTimers.remove(sliceTimerKey);
+            unawaited(
+              _failReceivingSession(sessionId, session, fileCtx, errorMsg),
+            );
+          },
+        );
+      }
+    }
+  }
+
+  void _updateReceivingProgressAndSpeed(
+    String sessionId,
+    TransferSession session,
+    _ActiveFileReceiveContext fileCtx,
+  ) {
+    discoveryService.touchPeer(session.peerId);
+    final sessionStopwatch =
+        _receivingSessionStopwatches[sessionId] ?? fileCtx.fileStopwatch;
+    if (!sessionStopwatch.isRunning) {
+      sessionStopwatch.start();
+    }
+    final initialSessionBytes = _receivingSessionInitialBytes[sessionId] ?? 0;
+    final elapsedMs = sessionStopwatch.elapsedMilliseconds;
+    final lastNotifyMs = _receivingSessionLastNotifyMs[sessionId] ?? 0;
+    if (elapsedMs - lastNotifyMs >= _uiNotifyIntervalMs) {
+      _receivingSessionLastNotifyMs[sessionId] = elapsedMs;
+      final totalDelta = max(0, session.transferredBytes - initialSessionBytes);
+      session.speedBytesPerSec = _computeSlidingSpeed(
+        previousSpeed: session.speedBytesPerSec,
+        totalDeltaBytes: totalDelta,
+        elapsedMs: elapsedMs,
+        windowStartMs: _receivingSessionWindowStartMs[sessionId] ?? 0,
+        windowStartBytes: _receivingSessionWindowStartBytes[sessionId] ?? 0,
+        onWindowReset: (newMs, newBytes) {
+          _receivingSessionWindowStartMs[sessionId] = newMs;
+          _receivingSessionWindowStartBytes[sessionId] = newBytes;
+        },
+      );
+      notifyListeners();
+    }
+
+    final lastLogMs = _receivingSessionLastLogMs[sessionId] ?? 0;
+    if (elapsedMs - lastLogMs >= 500) {
+      _receivingSessionLastLogMs[sessionId] = elapsedMs;
+      final pct = (session.progress * 100).toStringAsFixed(1);
+      TransferLogger.recv(
+        '接收进度 [$sessionId] ${fileCtx.fileItem.name}: $pct% '
+        '(${TransferSession.formatBytes(session.transferredBytes)} / ${TransferSession.formatBytes(session.totalBytes)}) '
+        '| 速率: ${TransferSession.formatSpeed(session.speedBytesPerSec)}',
+      );
+    }
+  }
+
+  Future<void> _finalizeSliceAndRespond({
+    required String sessionId,
+    required TransferSession session,
+    required _ActiveFileReceiveContext fileCtx,
+    SendPort? replyPort,
+  }) async {
+    try {
+      final finalizedFile = await _checkAndFinalizeReceivedFile(
+        sessionId: sessionId,
+        session: session,
+        fileCtx: fileCtx,
+      );
+      replyPort?.send({
+        'ok': true,
+        'savedPath': finalizedFile?.path ?? fileCtx.finalFile.path,
+      });
+    } catch (e) {
+      replyPort?.send({'ok': false, 'error': e.toString()});
+      await _failReceivingSession(
+        sessionId,
+        session,
+        fileCtx,
+        e.toString(),
+      );
+    }
+  }
+
+  Future<File?> _checkAndFinalizeReceivedFile({
+    required String sessionId,
+    required TransferSession session,
+    required _ActiveFileReceiveContext fileCtx,
+  }) async {
+    final fileItem = fileCtx.fileItem;
+    if (fileCtx.completedContiguousBytes < fileItem.size) {
+      return null;
+    }
+
+    _reservedTargetPaths.remove(fileCtx.finalFile.path);
+    final finalizedFile = await fileCtx.tryFinalize(
+      () => _resolveTargetFile(_saveDirectoryPath, fileItem),
+    );
+    if (finalizedFile == null) {
+      return null;
+    }
+
+    final sessionStopwatch =
+        _receivingSessionStopwatches[sessionId] ?? fileCtx.fileStopwatch;
+    final initialSessionBytes = _receivingSessionInitialBytes[sessionId] ?? 0;
+    final fileElapsedMs = max(1, fileCtx.fileStopwatch.elapsedMilliseconds);
+    final sessionElapsedMs = max(1, sessionStopwatch.elapsedMilliseconds);
+    final deltaBytes = max(0, session.transferredBytes - initialSessionBytes);
+    session.speedBytesPerSec = (deltaBytes * 1000) / sessionElapsedMs;
+
+    TransferLogger.recv(
+      '文件落盘完成 [$sessionId]: ${finalizedFile.path} '
+      '| 大小: ${TransferSession.formatBytes(fileItem.size)} '
+      '| 耗时: ${fileElapsedMs}ms '
+      '| 速率: ${TransferSession.formatSpeed(session.speedBytesPerSec)}',
+    );
+
+    session.savedPaths.add(finalizedFile.path);
+    if (session.savedPaths.length >= session.files.length) {
+      session.status = TransferStatus.completed;
+      session.transferredBytes = session.totalBytes;
+      _cancelSessionRetryGraceTimers(sessionId);
+      _activeReceivingSessions.remove(sessionId);
+      _sessionFileContexts.remove(sessionId);
+      _receivingSessionInitialBytes.remove(sessionId);
+      _receivingSessionStopwatches.remove(sessionId);
+      _receivingSessionLastNotifyMs.remove(sessionId);
+      _receivingSessionLastLogMs.remove(sessionId);
+      _receivingSessionWindowStartMs.remove(sessionId);
+      _receivingSessionWindowStartBytes.remove(sessionId);
+      _sessionTokens.remove(sessionId);
+      _notifyDataIsolatesSessionRemoved(sessionId);
+      TransferLogger.recv(
+        '✅ 会话全部接收完成 [$sessionId] | 共 ${session.savedPaths.length} 个文件 '
+        '(${TransferSession.formatBytes(session.totalBytes)})',
+      );
+    }
+    notifyListeners();
+    return finalizedFile;
+  }
+
+  void _cancelSessionRetryGraceTimers(String sessionId) {
+    final prefix = '$sessionId:';
+    final keysToRemove = _sessionRetryGraceTimers.keys
+        .where((k) => k == sessionId || k.startsWith(prefix))
+        .toList();
+    for (final k in keysToRemove) {
+      _sessionRetryGraceTimers.remove(k)?.cancel();
+    }
+  }
+
+  Future<void> _failReceivingSession(
+    String sessionId,
+    TransferSession session,
+    _ActiveFileReceiveContext fileCtx,
+    Object error,
+  ) async {
+    _cancelSessionRetryGraceTimers(sessionId);
+    if (!_activeReceivingSessions.containsKey(sessionId) &&
+        session.status != TransferStatus.transferring) {
+      return;
+    }
+    final isCancelled = _cancelledSessionIds.contains(sessionId);
+    _notifyDataIsolatesSessionCancelled(sessionId);
+
+    final allContexts = _sessionFileContexts.remove(sessionId);
+    if (allContexts != null) {
+      for (final fCtx in allContexts.values) {
+        _reservedTargetPaths.remove(fCtx.finalFile.path);
+        await fCtx.abort(deletePartFile: isCancelled);
+      }
+    } else {
+      _reservedTargetPaths.remove(fileCtx.finalFile.path);
+      await fileCtx.abort(deletePartFile: isCancelled);
+    }
+
+    if (isCancelled) {
+      session.status = TransferStatus.cancelled;
+      TransferLogger.recv('⚠️ 接收已取消 [$sessionId]: ${fileCtx.fileItem.name}');
+    } else {
+      session.status = TransferStatus.failed;
+      session.errorMessage = error.toString();
+      TransferLogger.error(
+        'Recv',
+        '接收中断 [$sessionId] (${fileCtx.fileItem.name}, 已保留连续断点 ${TransferSession.formatBytes(fileCtx.contiguousBytes)}): $error',
+      );
+    }
+    _activeReceivingSessions.remove(sessionId);
+    _receivingSessionInitialBytes.remove(sessionId);
+    _receivingSessionStopwatches.remove(sessionId);
+    _receivingSessionLastNotifyMs.remove(sessionId);
+    _receivingSessionLastLogMs.remove(sessionId);
+    _receivingSessionWindowStartMs.remove(sessionId);
+    _receivingSessionWindowStartBytes.remove(sessionId);
+    _sessionTokens.remove(sessionId);
+    notifyListeners();
+  }
+
+  Future<void> _registerSessionOnDataIsolates({
+    required String sessionId,
+    required String token,
+    required Map<String, _ActiveFileReceiveContext> fileContexts,
+  }) async {
+    if (_dataIsolateSendPorts.isEmpty) return;
+    final filesPayload = <String, Map<String, dynamic>>{};
+    for (final entry in fileContexts.entries) {
+      filesPayload[entry.key] = {
+        'partPath': entry.value.partFile.path,
+        'expectedSize': entry.value.fileItem.size,
+        'initialOffset': entry.value.initialOffset,
+      };
+    }
+    final ackFutures = <Future<dynamic>>[];
+    for (final sendPort in _dataIsolateSendPorts) {
+      final ackPort = ReceivePort();
+      sendPort.send({
+        'cmd': 'registerSession',
+        'sessionId': sessionId,
+        'token': token,
+        'files': filesPayload,
+        'ackPort': ackPort.sendPort,
+      });
+      ackFutures.add(
+        ackPort.first.whenComplete(ackPort.close),
+      );
+    }
+    await Future.wait(ackFutures);
+  }
+
+  void _notifyDataIsolatesSessionCancelled(String sessionId) {
+    for (final sendPort in _dataIsolateSendPorts) {
+      sendPort.send({
+        'cmd': 'cancelSession',
+        'sessionId': sessionId,
+      });
+    }
+  }
+
+  void _notifyDataIsolatesSessionRemoved(String sessionId) {
+    for (final sendPort in _dataIsolateSendPorts) {
+      sendPort.send({
+        'cmd': 'removeSession',
+        'sessionId': sessionId,
+      });
+    }
   }
 
   Future<void> _handleHttpRequest(HttpRequest request) async {
@@ -498,7 +1359,7 @@ class TransferService extends ChangeNotifier {
     final isLoopbackOrSelf = remoteIp == '127.0.0.1' ||
         remoteIp == '::1' ||
         remoteIp == '0.0.0.0' ||
-        remoteIp == discoveryService.localDevice.ip;
+        discoveryService.localAddresses.contains(remoteIp);
     return isLoopbackOrSelf ? parsed : parsed.copyWith(ip: remoteIp);
   }
 
@@ -568,11 +1429,26 @@ class TransferService extends ChangeNotifier {
 
   void _markSessionCancelledInternal(String sessionId) {
     _cancelledSessionIds.add(sessionId);
+    _cancelSessionRetryGraceTimers(sessionId);
+    _notifyDataIsolatesSessionCancelled(sessionId);
+    final cancelComp = _sessionCancelCompleters.remove(sessionId);
+    if (cancelComp != null && !cancelComp.isCompleted) {
+      cancelComp.complete();
+    }
+    final sendingIsolates = _activeSendingIsolates.remove(sessionId);
+    if (sendingIsolates != null) {
+      for (final iso in sendingIsolates) {
+        iso.kill(priority: Isolate.immediate);
+      }
+    }
+
     _sessionTokens.remove(sessionId);
     _receivingSessionStopwatches.remove(sessionId);
     _receivingSessionInitialBytes.remove(sessionId);
     _receivingSessionLastNotifyMs.remove(sessionId);
     _receivingSessionLastLogMs.remove(sessionId);
+    _receivingSessionWindowStartMs.remove(sessionId);
+    _receivingSessionWindowStartBytes.remove(sessionId);
 
     final fileContexts = _sessionFileContexts.remove(sessionId);
     if (fileContexts != null) {
@@ -633,6 +1509,7 @@ class TransferService extends ChangeNotifier {
         notifyPort > 0 &&
         notifySessionId.isNotEmpty) {
       final notifyClient = HttpClient()
+        ..findProxy = null
         ..connectionTimeout = const Duration(seconds: 2);
       try {
         final uri = Uri.parse(
@@ -771,12 +1648,14 @@ class TransferService extends ChangeNotifier {
       final resolved =
           _resolveTargetOrResumableFile(_saveDirectoryPath, fileItem);
       _reservedTargetPaths.add(resolved.finalFile.path);
-      fileContexts[fileItem.id] = _ActiveFileReceiveContext(
+      final fileCtx = _ActiveFileReceiveContext(
         fileItem: fileItem,
         finalFile: resolved.finalFile,
         partFile: resolved.partFile,
         initialOffset: resolved.resumeOffset,
       );
+      fileCtx.preparePartFileSync();
+      fileContexts[fileItem.id] = fileCtx;
       if (resolved.resumeOffset > 0) {
         resumeOffsets[fileItem.id] = resolved.resumeOffset;
         initialSessionBytes += resolved.resumeOffset;
@@ -788,10 +1667,19 @@ class TransferService extends ChangeNotifier {
     _activeReceivingSessions[sessionId] = session;
     _sessionFileContexts[sessionId] = fileContexts;
     _receivingSessionInitialBytes[sessionId] = initialSessionBytes;
-    _receivingSessionStopwatches[sessionId] = Stopwatch()..start();
+    _receivingSessionStopwatches[sessionId] = Stopwatch();
     _receivingSessionLastNotifyMs[sessionId] = 0;
     _receivingSessionLastLogMs[sessionId] = 0;
+    _receivingSessionWindowStartMs[sessionId] = 0;
+    _receivingSessionWindowStartBytes[sessionId] = 0;
     _sessionTokens[sessionId] = uploadToken;
+
+    await _registerSessionOnDataIsolates(
+      sessionId: sessionId,
+      token: uploadToken,
+      fileContexts: fileContexts,
+    );
+
     if (initialSessionBytes > 0) {
       TransferLogger.recv(
         '🔄 启用断点续传 [$sessionId] -> 已存在进度: ${TransferSession.formatBytes(initialSessionBytes)}',
@@ -804,12 +1692,38 @@ class TransferService extends ChangeNotifier {
       'accepted': true,
       'sessionId': sessionId,
       'token': uploadToken,
+      'dataPort': dataPort,
       'parallelChunkSize': _parallelSegmentSizeBytes,
       if (resumeOffsets.isNotEmpty) 'resumeOffsets': resumeOffsets,
     }));
     await request.response.close();
   }
 
+  double _computeSlidingSpeed({
+    required double previousSpeed,
+    required int totalDeltaBytes,
+    required int elapsedMs,
+    required int windowStartMs,
+    required int windowStartBytes,
+    required void Function(int newStartMs, int newStartBytes) onWindowReset,
+  }) {
+    if (elapsedMs <= 0) return previousSpeed;
+    final windowElapsedMs = elapsedMs - windowStartMs;
+    if (windowElapsedMs >= 400) {
+      final windowBytes = max(0, totalDeltaBytes - windowStartBytes);
+      final instantSpeed = (windowBytes * 1000.0) / windowElapsedMs;
+      onWindowReset(elapsedMs, totalDeltaBytes);
+      return previousSpeed <= 0
+          ? instantSpeed
+          : (previousSpeed * 0.35 + instantSpeed * 0.65);
+    }
+    if (previousSpeed <= 0) {
+      return (totalDeltaBytes * 1000.0) / elapsedMs;
+    }
+    return previousSpeed;
+  }
+
+  /// 主端口兼容/兜底文件上传处理器（每个分片使用独立的 RandomAccessFile 句柄，零 seek 竞争）
   Future<void> _handleFileUploadStream(HttpRequest request) async {
     final sessionId = request.uri.queryParameters['sessionId'] ?? '';
     final fileId = request.uri.queryParameters['fileId'] ?? '';
@@ -861,17 +1775,22 @@ class TransferService extends ChangeNotifier {
       return;
     }
 
-    await fileCtx.ensureOpen();
+    final sliceTimerKey = '$sessionId:$fileId:$sliceStart';
+    _sessionRetryGraceTimers.remove(sliceTimerKey)?.cancel();
+    fileCtx.preparePartFileSync();
     fileCtx.registerSegment(sliceStart, sliceEnd);
 
-    final writeBuffer = BytesBuilder(copy: false);
     final sessionStopwatch =
         _receivingSessionStopwatches[sessionId] ?? fileCtx.fileStopwatch;
-    final initialSessionBytes = _receivingSessionInitialBytes[sessionId] ?? 0;
-    int writeCursor = sliceStart;
-    int bytesInSlice = 0;
+    if (!sessionStopwatch.isRunning) {
+      sessionStopwatch.start();
+    }
+    if (!fileCtx.fileStopwatch.isRunning) {
+      fileCtx.fileStopwatch.start();
+    }
 
-    if (sliceStart == fileCtx.initialOffset) {
+    if (sliceStart == fileCtx.initialOffset && !fileCtx.startLogged) {
+      fileCtx.startLogged = true;
       TransferLogger.recv(
         '开始接收文件 [$sessionId] -> ${fileItem.relativePath ?? fileItem.name} '
         '(${TransferSession.formatBytes(fileItem.size)}'
@@ -879,10 +1798,45 @@ class TransferService extends ChangeNotifier {
       );
     }
 
+    RandomAccessFile? sliceRaf;
+    final writeBuffer = BytesBuilder(copy: false);
+    int writeCursor = sliceStart;
+    int bytesInSlice = 0;
+    Future<void> writeChain = Future.value();
+    int pendingWriteBytes = 0;
+    Object? asyncWriteError;
+
+    Future<void> enqueueSliceWrite(Uint8List bytes) {
+      final writeEnd = writeCursor + bytes.length;
+      writeCursor = writeEnd;
+      pendingWriteBytes += bytes.length;
+      final task = writeChain.then((_) async {
+        if (asyncWriteError != null) return;
+        await sliceRaf!.writeFrom(bytes);
+      }).catchError((Object err) {
+        asyncWriteError ??= err;
+        throw err;
+      }).whenComplete(() {
+        pendingWriteBytes -= bytes.length;
+      });
+      writeChain = task.catchError((Object _) {});
+      return task;
+    }
+
     try {
+      request.response.bufferOutput = false;
+      sliceRaf = await fileCtx.partFile.open(mode: FileMode.append);
+      fileCtx._activeLocalHandles.add(sliceRaf);
+      if (sliceLength > 0) {
+        await sliceRaf.setPosition(sliceStart);
+      }
+
       await for (final chunk in request) {
         if (_cancelledSessionIds.contains(sessionId)) {
           throw const SocketException('用户已取消接收');
+        }
+        if (asyncWriteError != null) {
+          throw asyncWriteError!;
         }
         bytesInSlice += chunk.length;
         if (fileItem.size > 0 && bytesInSlice > sliceLength) {
@@ -891,50 +1845,39 @@ class TransferService extends ChangeNotifier {
         writeBuffer.add(chunk);
         if (writeBuffer.length >= _diskWriteBufferBytes) {
           final bytesToWrite = writeBuffer.takeBytes();
-          await fileCtx.writeChunk(
-            sliceStart: sliceStart,
-            sliceEnd: sliceEnd,
-            writeOffset: writeCursor,
-            bytes: bytesToWrite,
-            flushThresholdBytes: _flushBackpressureBytes,
-          );
-          writeCursor += bytesToWrite.length;
-        }
-        session.transferredBytes += chunk.length;
-
-        final elapsedMs = sessionStopwatch.elapsedMilliseconds;
-        final lastNotifyMs = _receivingSessionLastNotifyMs[sessionId] ?? 0;
-        if (elapsedMs - lastNotifyMs >= _uiNotifyIntervalMs) {
-          _receivingSessionLastNotifyMs[sessionId] = elapsedMs;
-          if (elapsedMs > 0) {
-            final deltaBytes =
-                max(0, session.transferredBytes - initialSessionBytes);
-            session.speedBytesPerSec = (deltaBytes * 1000) / elapsedMs;
+          final writeFuture = enqueueSliceWrite(bytesToWrite);
+          if (pendingWriteBytes >= _maxPendingWriteBytes) {
+            await writeFuture;
+          } else {
+            unawaited(writeFuture.catchError((Object _) {}));
           }
-          notifyListeners();
         }
-        final lastLogMs = _receivingSessionLastLogMs[sessionId] ?? 0;
-        if (elapsedMs - lastLogMs >= 500) {
-          _receivingSessionLastLogMs[sessionId] = elapsedMs;
-          final pct = (session.progress * 100).toStringAsFixed(1);
-          TransferLogger.recv(
-            '接收进度 [$sessionId] ${fileItem.name}: $pct% '
-            '(${TransferSession.formatBytes(session.transferredBytes)} / ${TransferSession.formatBytes(session.totalBytes)}) '
-            '| 速率: ${TransferSession.formatSpeed(session.speedBytesPerSec)}',
+        final netNewBytes = fileCtx.updateSegmentProgress(
+          sliceStart,
+          sliceEnd,
+          sliceStart + bytesInSlice,
+        );
+        if (netNewBytes > 0) {
+          session.transferredBytes = min(
+            session.totalBytes,
+            session.transferredBytes + netNewBytes,
           );
         }
+        _updateReceivingProgressAndSpeed(sessionId, session, fileCtx);
       }
+
       if (writeBuffer.isNotEmpty) {
         final bytesToWrite = writeBuffer.takeBytes();
-        await fileCtx.writeChunk(
-          sliceStart: sliceStart,
-          sliceEnd: sliceEnd,
-          writeOffset: writeCursor,
-          bytes: bytesToWrite,
-          flushThresholdBytes: _flushBackpressureBytes,
-        );
-        writeCursor += bytesToWrite.length;
+        await enqueueSliceWrite(bytesToWrite);
       }
+      await writeChain;
+      if (asyncWriteError != null) {
+        throw asyncWriteError!;
+      }
+
+      fileCtx._activeLocalHandles.remove(sliceRaf);
+      await sliceRaf.close();
+      sliceRaf = null;
 
       if (fileItem.size > 0 && bytesInSlice != sliceLength) {
         throw HttpException(
@@ -942,46 +1885,18 @@ class TransferService extends ChangeNotifier {
         );
       }
 
-      File? finalizedFile;
-      if (fileCtx.contiguousBytes >= fileItem.size) {
-        _reservedTargetPaths.remove(fileCtx.finalFile.path);
-        finalizedFile = await fileCtx.tryFinalize(
-          () => _resolveTargetFile(_saveDirectoryPath, fileItem),
+      final remNewBytes = fileCtx.markSegmentCompleted(sliceStart, sliceEnd);
+      if (remNewBytes > 0) {
+        session.transferredBytes = min(
+          session.totalBytes,
+          session.transferredBytes + remNewBytes,
         );
       }
-
-      if (finalizedFile != null) {
-        final fileElapsedMs = max(1, fileCtx.fileStopwatch.elapsedMilliseconds);
-        final sessionElapsedMs = max(1, sessionStopwatch.elapsedMilliseconds);
-        final deltaBytes =
-            max(0, session.transferredBytes - initialSessionBytes);
-        session.speedBytesPerSec = (deltaBytes * 1000) / sessionElapsedMs;
-
-        TransferLogger.recv(
-          '文件落盘完成 [$sessionId]: ${finalizedFile.path} '
-          '| 大小: ${TransferSession.formatBytes(fileItem.size)} '
-          '| 耗时: ${fileElapsedMs}ms '
-          '| 速率: ${TransferSession.formatSpeed(session.speedBytesPerSec)}',
-        );
-
-        session.savedPaths.add(finalizedFile.path);
-        if (session.savedPaths.length >= session.files.length) {
-          session.status = TransferStatus.completed;
-          session.transferredBytes = session.totalBytes;
-          _activeReceivingSessions.remove(sessionId);
-          _sessionFileContexts.remove(sessionId);
-          _receivingSessionInitialBytes.remove(sessionId);
-          _receivingSessionStopwatches.remove(sessionId);
-          _receivingSessionLastNotifyMs.remove(sessionId);
-          _receivingSessionLastLogMs.remove(sessionId);
-          _sessionTokens.remove(sessionId);
-          TransferLogger.recv(
-            '✅ 会话全部接收完成 [$sessionId] | 共 ${session.savedPaths.length} 个文件 '
-            '(${TransferSession.formatBytes(session.totalBytes)})',
-          );
-        }
-        notifyListeners();
-      }
+      final finalizedFile = await _checkAndFinalizeReceivedFile(
+        sessionId: sessionId,
+        session: session,
+        fileCtx: fileCtx,
+      );
 
       request.response.headers.contentType = ContentType.json;
       request.response.write(jsonEncode({
@@ -991,48 +1906,35 @@ class TransferService extends ChangeNotifier {
       await request.response.close();
     } catch (e) {
       final isCancelled = _cancelledSessionIds.contains(sessionId);
-      if (!isCancelled && writeBuffer.isNotEmpty) {
+      if (!isCancelled && sliceRaf != null && writeBuffer.isNotEmpty) {
         try {
           final remainingBytes = writeBuffer.takeBytes();
-          await fileCtx.writeChunk(
-            sliceStart: sliceStart,
-            sliceEnd: sliceEnd,
-            writeOffset: writeCursor,
-            bytes: remainingBytes,
-            flushThresholdBytes: _flushBackpressureBytes,
-          );
-          writeCursor += remainingBytes.length;
+          await enqueueSliceWrite(remainingBytes);
+          await writeChain;
         } catch (_) {}
       }
-      final allContexts = _sessionFileContexts.remove(sessionId);
-      if (allContexts != null) {
-        for (final fCtx in allContexts.values) {
-          _reservedTargetPaths.remove(fCtx.finalFile.path);
-          await fCtx.abort(deletePartFile: isCancelled);
-        }
-      } else {
-        _reservedTargetPaths.remove(fileCtx.finalFile.path);
-        await fileCtx.abort(deletePartFile: isCancelled);
+      if (sliceRaf != null) {
+        fileCtx._activeLocalHandles.remove(sliceRaf);
+        try {
+          await sliceRaf.close();
+        } catch (_) {}
+        sliceRaf = null;
       }
-
       if (isCancelled) {
-        session.status = TransferStatus.cancelled;
-        TransferLogger.recv('⚠️ 接收已取消 [$sessionId]: ${fileItem.name}');
+        await _failReceivingSession(sessionId, session, fileCtx, e);
       } else {
-        session.status = TransferStatus.failed;
-        session.errorMessage = e.toString();
-        TransferLogger.error(
-          'Recv',
-          '接收中断 [$sessionId] (${fileItem.name}, 已保留连续断点 ${TransferSession.formatBytes(fileCtx.contiguousBytes)}): $e',
+        TransferLogger.recv(
+          '主端口分片接收闪断 [$sessionId] (${fileItem.name} @ $sliceStart)，等待发送方自动重传: $e',
+        );
+        _sessionRetryGraceTimers[sliceTimerKey]?.cancel();
+        _sessionRetryGraceTimers[sliceTimerKey] = Timer(
+          const Duration(seconds: 8),
+          () {
+            _sessionRetryGraceTimers.remove(sliceTimerKey);
+            unawaited(_failReceivingSession(sessionId, session, fileCtx, e));
+          },
         );
       }
-      _activeReceivingSessions.remove(sessionId);
-      _receivingSessionInitialBytes.remove(sessionId);
-      _receivingSessionStopwatches.remove(sessionId);
-      _receivingSessionLastNotifyMs.remove(sessionId);
-      _receivingSessionLastLogMs.remove(sessionId);
-      _sessionTokens.remove(sessionId);
-      notifyListeners();
       rethrow;
     }
   }
@@ -1173,12 +2075,63 @@ class TransferService extends ChangeNotifier {
     return candidate;
   }
 
-  /// 向指定局域网设备发送文件列表（具备 TCP 背压流控与令牌鉴权）
+  /// 多网卡路径优选：若目标设备同时暴露了雷雳网桥/有线直连地址与 Wi-Fi 地址，优先选择与本机同子网的高速直连 IP
+  PeerDevice _resolveBestPeerEndpoint(PeerDevice peer) {
+    if (peer.deviceType == DeviceType.web ||
+        peer.transferPort <= 0 ||
+        peer.ip == '127.0.0.1' ||
+        peer.ip.startsWith('10.0.2.')) {
+      return peer;
+    }
+    final candidates = peer.candidateIps;
+    if (candidates.length <= 1) return peer;
+    final localIps = discoveryService.localAddresses;
+
+    // 1. 优先匹配两台 Mac 之间的雷雳网桥 / 网线直连链路本地网段 (169.254.0.0/16)
+    final hasLocalLinkLocal = localIps.any((ip) => ip.startsWith('169.254.'));
+    if (hasLocalLinkLocal) {
+      for (final candidate in candidates) {
+        if (candidate.startsWith('169.254.')) {
+          return peer.copyWith(ip: candidate);
+        }
+      }
+    }
+
+    // 2. 精确匹配同 /24 子网前缀
+    for (final localIp in localIps) {
+      final dotIdx = localIp.lastIndexOf('.');
+      if (dotIdx <= 0) continue;
+      final prefix = localIp.substring(0, dotIdx + 1);
+      for (final candidate in candidates) {
+        if (candidate.startsWith(prefix)) {
+          return peer.copyWith(ip: candidate);
+        }
+      }
+    }
+
+    // 3. 兼容匹配 /23 超网相邻子网前缀（如 192.168.20.x <-> 192.168.21.x）
+    for (final localIp in localIps) {
+      final parts = localIp.split('.');
+      if (parts.length != 4) continue;
+      final thirdOctet = int.tryParse(parts[2]);
+      if (thirdOctet == null) continue;
+      final companionPrefix = '${parts[0]}.${parts[1]}.${thirdOctet ^ 1}.';
+      for (final candidate in candidates) {
+        if (candidate.startsWith(companionPrefix)) {
+          return peer.copyWith(ip: candidate);
+        }
+      }
+    }
+    return peer;
+  }
+
+  /// 向指定局域网设备发送文件列表（具备双流 64MB 大分块交替流水线、分块级自动退避重传、TCP 背压流控与令牌鉴权）
   Future<TransferSession> sendFilesToPeer({
     required PeerDevice peer,
     required List<TransferFileItem> files,
     String? textMessage,
   }) async {
+    peer = _resolveBestPeerEndpoint(peer);
     final totalBytes = files.fold<int>(0, (sum, f) => sum + f.size);
     final localSessionId =
         'out-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(99999)}';
@@ -1223,9 +2176,10 @@ class TransferService extends ChangeNotifier {
     }
 
     final client = HttpClient()
+      ..findProxy = null
       ..connectionTimeout = const Duration(seconds: 3)
       ..idleTimeout = const Duration(seconds: 30)
-      ..maxConnectionsPerHost = 8
+      ..maxConnectionsPerHost = 6
       ..autoUncompress = false;
     _activeSendingClients[localSessionId] = client;
     _activeSendingRemotes[localSessionId] = (
@@ -1233,26 +2187,43 @@ class TransferService extends ChangeNotifier {
       port: peer.transferPort,
       remoteSessionId: localSessionId,
     );
+    final cancelCompleter = Completer<void>();
+    _sessionCancelCompleters[localSessionId] = cancelCompleter;
+    final spawnedSenderIsolates = <Isolate>[];
+    _activeSendingIsolates[localSessionId] = spawnedSenderIsolates;
 
     try {
-      final prepUri =
-          Uri.parse('http://${peer.ip}:${peer.transferPort}/api/prepare-upload');
-      HttpClientRequest prepReq;
-      HttpClientResponse prepResp;
-      try {
-        prepReq = await client.postUrl(prepUri);
-        prepReq.headers.contentType = ContentType.json;
-        prepReq.add(utf8.encode(jsonEncode({
-          'clientSessionId': localSessionId,
-          'sender': discoveryService.localDevice.toJson(),
-          'files': files.map((f) => f.toJson()).toList(),
-          'textMessage': textMessage,
-        })));
-        prepResp = await prepReq.close();
-      } on Exception catch (connErr) {
-        if (_cancelledSessionIds.contains(localSessionId)) rethrow;
+      HttpClientResponse? prepResp;
+      Object? lastConnErr;
+      for (final candidateIp in peer.candidateIps) {
+        final prepUri = Uri.parse(
+          'http://$candidateIp:${peer.transferPort}/api/prepare-upload',
+        );
+        try {
+          final prepReq = await client.postUrl(prepUri);
+          prepReq.headers.contentType = ContentType.json;
+          prepReq.add(utf8.encode(jsonEncode({
+            'clientSessionId': localSessionId,
+            'sender': discoveryService.localDevice.toJson(),
+            'files': files.map((f) => f.toJson()).toList(),
+            'textMessage': textMessage,
+          })));
+          prepResp = await prepReq.close();
+          if (candidateIp != peer.ip) {
+            peer = peer.copyWith(ip: candidateIp);
+          }
+          break;
+        } on Exception catch (connErr) {
+          lastConnErr = connErr;
+          if (_cancelledSessionIds.contains(localSessionId)) rethrow;
+        }
+      }
+      if (prepResp == null) {
+        if (_cancelledSessionIds.contains(localSessionId)) {
+          throw lastConnErr ?? const SocketException('用户已取消发送');
+        }
         TransferLogger.send(
-          '直连 ${peer.ip}:${peer.transferPort} 不可达 ($connErr)，自动切换为反向拉取 (Reverse-Pull) 通道...',
+          '直连 ${peer.ip}:${peer.transferPort} 不可达 ($lastConnErr)，自动切换为反向拉取 (Reverse-Pull) 通道...',
         );
         return await _sendViaReversePull(
           peer: peer,
@@ -1281,11 +2252,17 @@ class TransferService extends ChangeNotifier {
       final remoteSessionId =
           prepJson['sessionId'] as String? ?? localSessionId;
       final uploadToken = prepJson['token'] as String? ?? '';
-      final rawResumeOffsets =
-          prepJson['resumeOffsets'] as Map<String, dynamic>? ?? const {};
-      final parallelChunkSize =
+      final remoteDataPort =
+          (prepJson['dataPort'] as num?)?.toInt() ?? peer.transferPort;
+      final targetUploadPort =
+          remoteDataPort > 0 ? remoteDataPort : peer.transferPort;
+      final remoteChunkSize =
           (prepJson['parallelChunkSize'] as num?)?.toInt() ??
               _parallelSegmentSizeBytes;
+      final segmentSize =
+          remoteChunkSize > 0 ? remoteChunkSize : _parallelSegmentSizeBytes;
+      final rawResumeOffsets =
+          prepJson['resumeOffsets'] as Map<String, dynamic>? ?? const {};
 
       _activeSendingRemotes[localSessionId] = (
         ip: peer.ip,
@@ -1300,8 +2277,8 @@ class TransferService extends ChangeNotifier {
         return session;
       }
 
-      // 构建多文件与单大文件多路分片任务队列（支持断点续传与 16MB 滑动窗口并发）
-      final segmentTasks = <_UploadSegmentTask>[];
+      // 构建 64MB 大分块交替流水线队列（小文件直接单流顺序直传，超大文件切分为 64MB 分块由最多 2 个后台 Isolate 并行推流）
+      final tasks = <_UploadSegmentTask>[];
       int resumedTotal = 0;
 
       for (int i = 0; i < files.length; i++) {
@@ -1316,10 +2293,26 @@ class TransferService extends ChangeNotifier {
           continue;
         }
 
-        if (fileItem.size == 0 ||
-            parallelChunkSize <= 0 ||
-            remainingBytes <= parallelChunkSize) {
-          segmentTasks.add(
+        if (segmentSize > 0 &&
+            fileItem.localPath != null &&
+            remainingBytes > segmentSize) {
+          final segCount = (remainingBytes + segmentSize - 1) ~/ segmentSize;
+          for (int s = 0; s < segCount; s++) {
+            final segOffset = resumeOffset + s * segmentSize;
+            final segLen = min(segmentSize, fileItem.size - segOffset);
+            tasks.add(
+              _UploadSegmentTask(
+                fileItem: fileItem,
+                fileIndex: i,
+                offset: segOffset,
+                length: segLen,
+                segmentIndex: s,
+                totalSegments: segCount,
+              ),
+            );
+          }
+        } else {
+          tasks.add(
             _UploadSegmentTask(
               fileItem: fileItem,
               fileIndex: i,
@@ -1329,25 +2322,6 @@ class TransferService extends ChangeNotifier {
               totalSegments: 1,
             ),
           );
-        } else {
-          final totalSegments =
-              (remainingBytes + parallelChunkSize - 1) ~/ parallelChunkSize;
-          int segIdx = 0;
-          for (int offset = resumeOffset;
-              offset < fileItem.size;
-              offset += parallelChunkSize) {
-            final segLen = min(parallelChunkSize, fileItem.size - offset);
-            segmentTasks.add(
-              _UploadSegmentTask(
-                fileItem: fileItem,
-                fileIndex: i,
-                offset: offset,
-                length: segLen,
-                segmentIndex: segIdx++,
-                totalSegments: totalSegments,
-              ),
-            );
-          }
         }
       }
 
@@ -1358,118 +2332,231 @@ class TransferService extends ChangeNotifier {
       final stopwatch = Stopwatch()..start();
       int lastNotifyMs = 0;
       int lastLogMs = 0;
+      int speedWindowStartMs = 0;
+      int speedWindowStartBytes = 0;
       int bytesSentInCurrentRun = 0;
 
-      // 多文件/大文件分片并发流水线传输（Keep-Alive 连接复用，最多 6 路并发）
-      final concurrency =
-          segmentTasks.isEmpty ? 1 : min(6, segmentTasks.length);
+      void recordSentDelta(int delta) {
+        if (delta == 0) return;
+        bytesSentInCurrentRun = max(0, bytesSentInCurrentRun + delta);
+        session.transferredBytes =
+            min(session.totalBytes, resumedTotal + bytesSentInCurrentRun);
+        if (delta < 0) {
+          notifyListeners();
+          return;
+        }
+        discoveryService.touchPeer(peer.id);
+
+        final elapsedMs = stopwatch.elapsedMilliseconds;
+        if (elapsedMs - lastNotifyMs >= _uiNotifyIntervalMs) {
+          lastNotifyMs = elapsedMs;
+          session.speedBytesPerSec = _computeSlidingSpeed(
+            previousSpeed: session.speedBytesPerSec,
+            totalDeltaBytes: bytesSentInCurrentRun,
+            elapsedMs: elapsedMs,
+            windowStartMs: speedWindowStartMs,
+            windowStartBytes: speedWindowStartBytes,
+            onWindowReset: (newMs, newBytes) {
+              speedWindowStartMs = newMs;
+              speedWindowStartBytes = newBytes;
+            },
+          );
+          notifyListeners();
+        }
+        if (elapsedMs - lastLogMs >= 500) {
+          lastLogMs = elapsedMs;
+          final pct = (session.progress * 100).toStringAsFixed(1);
+          TransferLogger.send(
+            '发送进度 [$localSessionId]: $pct% '
+            '(${TransferSession.formatBytes(session.transferredBytes)} / ${TransferSession.formatBytes(session.totalBytes)}) '
+            '| 速率: ${TransferSession.formatSpeed(session.speedBytesPerSec)}',
+          );
+        }
+      }
+
+      final diskTasks = tasks
+          .where((t) => t.fileItem.localPath != null)
+          .toList(growable: false);
+      final memoryTasks = tasks
+          .where((t) => t.fileItem.localPath == null)
+          .toList(growable: false);
+      final workerCount = diskTasks.isEmpty
+          ? 0
+          : min(_maxParallelUploadStreams, diskTasks.length);
+
       TransferLogger.send(
-        '对方已接受 [$localSessionId]，开始流式上传 '
-        '(分片任务数: ${segmentTasks.length}, 并发通道数: $concurrency'
+        '对方已接受 [$localSessionId]，启动流式上传 -> 目标数据端口: $targetUploadPort '
+        '(总分片: ${tasks.length}, 并发流数: $workerCount'
         '${resumedTotal > 0 ? ", 已跳过断点: ${TransferSession.formatBytes(resumedTotal)}" : ""})...',
       );
-      int nextTaskIndex = 0;
 
-      Future<void> uploadWorker() async {
-        while (true) {
-          if (_cancelledSessionIds.contains(localSessionId)) {
-            return;
-          }
-          final taskIdx = nextTaskIndex++;
-          if (taskIdx >= segmentTasks.length) return;
-          final task = segmentTasks[taskIdx];
-          final fileItem = task.fileItem;
+      // 1. 内存文件（如剪贴板或测试小文件）直接通过 Keep-Alive 连接发送（支持最多 3 次自动重试）
+      for (final task in memoryTasks) {
+        if (_cancelledSessionIds.contains(localSessionId)) break;
+        final fileItem = task.fileItem;
+        final uploadUri = Uri.parse(
+          'http://${peer.ip}:$targetUploadPort/api/upload'
+          '?sessionId=${Uri.encodeComponent(remoteSessionId)}'
+          '&fileId=${Uri.encodeComponent(fileItem.id)}'
+          '&fileName=${Uri.encodeComponent(fileItem.name)}'
+          '&offset=${task.offset}'
+          '&length=${task.length}'
+          '&token=${Uri.encodeComponent(uploadToken)}',
+        );
+        const int maxMemAttempts = 3;
+        for (int attempt = 1; attempt <= maxMemAttempts; attempt++) {
+          int sentInAttempt = 0;
+          try {
+            final uploadReq = await client.postUrl(uploadUri);
+            uploadReq.bufferOutput = false;
+            uploadReq.headers.contentType = ContentType.binary;
+            uploadReq.headers.set('X-Upload-Token', uploadToken);
+            uploadReq.contentLength = task.length;
 
-          if (task.segmentIndex == 0) {
-            TransferLogger.send(
-              '上传文件 [${task.fileIndex + 1}/${files.length}]: '
-              '${fileItem.relativePath ?? fileItem.name} '
-              '(${TransferSession.formatBytes(fileItem.size)}'
-              '${task.offset > 0 ? ", 续传起点: ${TransferSession.formatBytes(task.offset)}" : ""}'
-              '${task.totalSegments > 1 ? ", 并发分片: ${task.totalSegments}片" : ""})',
+            final rawStream = _openFileOrMemoryStream(
+              fileItem,
+              start: task.offset,
+              end: task.offset + task.length,
             );
-          }
-
-          final uploadUri = Uri.parse(
-            'http://${peer.ip}:${peer.transferPort}/api/upload'
-            '?sessionId=${Uri.encodeComponent(remoteSessionId)}'
-            '&fileId=${Uri.encodeComponent(fileItem.id)}'
-            '&fileName=${Uri.encodeComponent(fileItem.name)}'
-            '&offset=${task.offset}'
-            '&length=${task.length}',
-          );
-
-          final uploadReq = await client.postUrl(uploadUri);
-          uploadReq.headers.contentType = ContentType.binary;
-          uploadReq.headers.set('X-Upload-Token', uploadToken);
-          uploadReq.contentLength = task.length;
-
-          final rawStream = _openFileOrMemoryStream(
-            fileItem,
-            start: task.offset,
-            end: task.offset + task.length,
-          );
-          final coalesceBuffer = BytesBuilder(copy: false);
-          final trackedStream = rawStream.transform<List<int>>(
-            StreamTransformer.fromHandlers(
-              handleData: (chunk, sink) {
-                if (_cancelledSessionIds.contains(localSessionId)) {
-                  sink.addError(const SocketException('用户已取消发送'));
-                  return;
-                }
-                coalesceBuffer.add(chunk);
-                if (coalesceBuffer.length >= _sendChunkCoalesceBytes) {
-                  sink.add(coalesceBuffer.takeBytes());
-                }
-                bytesSentInCurrentRun += chunk.length;
-                session.transferredBytes =
-                    min(session.totalBytes, resumedTotal + bytesSentInCurrentRun);
-
-                final elapsedMs = stopwatch.elapsedMilliseconds;
-                if (elapsedMs - lastNotifyMs >= _uiNotifyIntervalMs) {
-                  lastNotifyMs = elapsedMs;
-                  if (elapsedMs > 0) {
-                    session.speedBytesPerSec =
-                        (bytesSentInCurrentRun * 1000) / elapsedMs;
+            final trackedStream = rawStream.transform<List<int>>(
+              StreamTransformer.fromHandlers(
+                handleData: (chunk, sink) {
+                  if (_cancelledSessionIds.contains(localSessionId)) {
+                    sink.addError(const SocketException('用户已取消发送'));
+                    return;
                   }
-                  notifyListeners();
-                }
-                if (elapsedMs - lastLogMs >= 500) {
-                  lastLogMs = elapsedMs;
-                  final pct = (session.progress * 100).toStringAsFixed(1);
-                  TransferLogger.send(
-                    '发送进度 [$localSessionId]: $pct% '
-                    '(${TransferSession.formatBytes(session.transferredBytes)} / ${TransferSession.formatBytes(session.totalBytes)}) '
-                    '| 速率: ${TransferSession.formatSpeed(session.speedBytesPerSec)}',
-                  );
-                }
-              },
-              handleDone: (sink) {
-                if (!_cancelledSessionIds.contains(localSessionId) &&
-                    coalesceBuffer.isNotEmpty) {
-                  sink.add(coalesceBuffer.takeBytes());
-                } else {
-                  coalesceBuffer.clear();
-                }
-                sink.close();
-              },
-            ),
-          );
-
-          await uploadReq.addStream(trackedStream);
-
-          final uploadResp = await uploadReq.close();
-          await uploadResp.drain<void>();
-          if (uploadResp.statusCode != HttpStatus.ok) {
-            throw Exception(
-              '文件 ${fileItem.name} 分片传输失败 (${uploadResp.statusCode})',
+                  sink.add(chunk);
+                  sentInAttempt += chunk.length;
+                  recordSentDelta(chunk.length);
+                },
+              ),
             );
+            await uploadReq.addStream(trackedStream);
+            final uploadResp = await uploadReq.close();
+            await uploadResp.drain<void>();
+            if (uploadResp.statusCode == HttpStatus.ok) {
+              break;
+            }
+            throw HttpException(
+              '文件 ${fileItem.name} 传输失败 (${uploadResp.statusCode})',
+            );
+          } catch (err) {
+            if (sentInAttempt > 0) {
+              recordSentDelta(-sentInAttempt);
+            }
+            if (_cancelledSessionIds.contains(localSessionId) ||
+                attempt >= maxMemAttempts) {
+              rethrow;
+            }
+            await Future<void>.delayed(Duration(milliseconds: 300 * attempt));
           }
         }
       }
 
-      if (segmentTasks.isNotEmpty) {
-        await Future.wait(List.generate(concurrency, (_) => uploadWorker()));
+      // 2. 磁盘文件通过最多 2 个独立后台 Isolate 交替读取各自的 RandomAccessFile 句柄并并发推流
+      if (diskTasks.isNotEmpty &&
+          !_cancelledSessionIds.contains(localSessionId)) {
+        final workerCmdPorts = <SendPort>[];
+        for (int w = 0; w < workerCount; w++) {
+          final initPort = ReceivePort();
+          final iso = await Isolate.spawn(
+            _senderWorkerIsolateEntry,
+            initPort.sendPort,
+            debugName: 'TransferSenderWorker-$w',
+          );
+          spawnedSenderIsolates.add(iso);
+          final cmdPort = await initPort.first as SendPort;
+          initPort.close();
+          workerCmdPorts.add(cmdPort);
+        }
+
+        int nextTaskIdx = 0;
+        Object? firstWorkerError;
+
+        Future<void> runWorkerLoop(SendPort cmdPort) async {
+          while (!_cancelledSessionIds.contains(localSessionId) &&
+              firstWorkerError == null) {
+            final idx = nextTaskIdx++;
+            if (idx >= diskTasks.length) return;
+            final task = diskTasks[idx];
+            final fileItem = task.fileItem;
+
+            if (task.segmentIndex == 0) {
+              TransferLogger.send(
+                '上传文件 [${task.fileIndex + 1}/${files.length}]: '
+                '${fileItem.relativePath ?? fileItem.name} '
+                '(${TransferSession.formatBytes(fileItem.size)}, 共 ${task.totalSegments} 个分片'
+                '${task.offset > 0 ? ", 续传起点: ${TransferSession.formatBytes(task.offset)}" : ""})',
+              );
+            }
+
+            final uploadUrl = 'http://${peer.ip}:$targetUploadPort/api/upload'
+                '?sessionId=${Uri.encodeComponent(remoteSessionId)}'
+                '&fileId=${Uri.encodeComponent(fileItem.id)}'
+                '&fileName=${Uri.encodeComponent(fileItem.name)}'
+                '&offset=${task.offset}'
+                '&length=${task.length}'
+                '&token=${Uri.encodeComponent(uploadToken)}';
+
+            final replyPort = ReceivePort();
+            final doneCompleter = Completer<void>();
+            final sub = replyPort.listen((dynamic msg) {
+              if (msg is! Map) return;
+              final type = msg['type'] as String? ?? '';
+              if (type == 'progress') {
+                final delta = msg['delta'] as int? ?? 0;
+                recordSentDelta(delta);
+              } else if (type == 'done') {
+                final delta = msg['delta'] as int? ?? 0;
+                recordSentDelta(delta);
+                if (!doneCompleter.isCompleted) {
+                  doneCompleter.complete();
+                }
+              } else if (type == 'error') {
+                final errMsg = msg['error'] as String? ?? '分片上传失败';
+                if (!doneCompleter.isCompleted) {
+                  doneCompleter.completeError(Exception(errMsg));
+                }
+              }
+            });
+
+            cmdPort.send({
+              'cmd': 'uploadSlice',
+              'replyPort': replyPort.sendPort,
+              'url': uploadUrl,
+              'token': uploadToken,
+              'localPath': fileItem.localPath!,
+              'offset': task.offset,
+              'length': task.length,
+            });
+
+            try {
+              await Future.any([
+                doneCompleter.future,
+                cancelCompleter.future,
+              ]);
+            } catch (err) {
+              firstWorkerError ??= err;
+              rethrow;
+            } finally {
+              await sub.cancel();
+              replyPort.close();
+            }
+          }
+        }
+
+        try {
+          await Future.wait(
+            workerCmdPorts.map(runWorkerLoop),
+          );
+        } finally {
+          for (final cmdPort in workerCmdPorts) {
+            cmdPort.send({'cmd': 'shutdown'});
+          }
+        }
+        if (firstWorkerError != null) {
+          throw firstWorkerError!;
+        }
       }
 
       if (_cancelledSessionIds.contains(localSessionId)) {
@@ -1507,41 +2594,79 @@ class TransferService extends ChangeNotifier {
       notifyListeners();
       return session;
     } finally {
+      _sessionCancelCompleters.remove(localSessionId);
+      final isolates = _activeSendingIsolates.remove(localSessionId);
+      if (isolates != null) {
+        for (final iso in isolates) {
+          iso.kill(priority: Isolate.immediate);
+        }
+      }
       _activeSendingClients.remove(localSessionId);
       _activeSendingRemotes.remove(localSessionId);
       client.close();
     }
   }
 
+  /// 双缓冲 2MB 顺序预读文件流（让磁盘下一块读取与当前块网络发送在后台并行重叠，消除 64KB openRead 瓶颈）
   Stream<List<int>> _openFileOrMemoryStream(
     TransferFileItem fileItem, {
     int? start,
     int? end,
-  }) {
+  }) async* {
     if (fileItem.localPath != null) {
-      return File(fileItem.localPath!).openRead(start, end);
+      final raf = await File(fileItem.localPath!).open(mode: FileMode.read);
+      try {
+        final fileLen = await raf.length();
+        final startPos = (start ?? 0).clamp(0, fileLen);
+        final endPos = (end ?? fileLen).clamp(startPos, fileLen);
+        int remaining = endPos - startPos;
+        if (remaining <= 0) return;
+
+        if (startPos > 0) {
+          await raf.setPosition(startPos);
+        }
+
+        int currentReadSize = min(_fileReadChunkBytes, remaining);
+        remaining -= currentReadSize;
+        Future<Uint8List> pendingRead = raf.read(currentReadSize);
+
+        while (true) {
+          final chunk = await pendingRead;
+          if (chunk.isEmpty) break;
+
+          Future<Uint8List>? nextRead;
+          if (remaining > 0 && chunk.length == currentReadSize) {
+            final nextSize = min(_fileReadChunkBytes, remaining);
+            remaining -= nextSize;
+            currentReadSize = nextSize;
+            nextRead = raf.read(nextSize);
+          }
+
+          yield chunk;
+
+          if (nextRead == null) break;
+          pendingRead = nextRead;
+        }
+      } finally {
+        try {
+          await raf.close();
+        } catch (_) {}
+      }
+      return;
     }
+
     final bytes = fileItem.memoryBytes;
     if (bytes == null || bytes.isEmpty) {
-      return const Stream<List<int>>.empty();
+      return;
     }
     final startPos = (start ?? 0).clamp(0, bytes.length);
     final endPos = (end ?? bytes.length).clamp(startPos, bytes.length);
-    if (startPos >= endPos) {
-      return const Stream<List<int>>.empty();
+    for (int offset = startPos; offset < endPos; offset += _fileReadChunkBytes) {
+      final chunkEnd = min(offset + _fileReadChunkBytes, endPos);
+      yield bytes is Uint8List
+          ? Uint8List.sublistView(bytes, offset, chunkEnd)
+          : bytes.sublist(offset, chunkEnd);
     }
-    final chunks = <List<int>>[];
-    for (int offset = startPos;
-        offset < endPos;
-        offset += _sendChunkCoalesceBytes) {
-      final chunkEnd = min(offset + _sendChunkCoalesceBytes, endPos);
-      chunks.add(
-        bytes is Uint8List
-            ? Uint8List.sublistView(bytes, offset, chunkEnd)
-            : bytes.sublist(offset, chunkEnd),
-      );
-    }
-    return Stream<List<int>>.fromIterable(chunks);
   }
 
   /// 反向拉取发送模式：适用于目标节点处于单向 NAT（如 Android 模拟器 10.0.2.16）、Web 浏览器或防火墙阻止入站连接的场景
@@ -1692,15 +2817,58 @@ class TransferService extends ChangeNotifier {
     final fileItem = matching.first;
     final rawOffset =
         int.tryParse(request.uri.queryParameters['offset'] ?? '') ?? 0;
-    final startOffset = rawOffset.clamp(0, fileItem.size);
-    final remainingLength = fileItem.size - startOffset;
+    int startOffset = rawOffset.clamp(0, fileItem.size);
+    int endExclusive = fileItem.size;
+    bool isRangeRequest = false;
+
+    final rangeHeader = request.headers.value(HttpHeaders.rangeHeader);
+    if (rangeHeader != null &&
+        rangeHeader.startsWith('bytes=') &&
+        fileItem.size > 0) {
+      final rangeSpec = rangeHeader.substring('bytes='.length).split(',').first.trim();
+      final parts = rangeSpec.split('-');
+      if (parts.length == 2) {
+        final parsedStart = int.tryParse(parts[0].trim());
+        final parsedEnd = parts[1].trim().isEmpty
+            ? (fileItem.size - 1)
+            : int.tryParse(parts[1].trim());
+        if (parsedStart != null &&
+            parsedEnd != null &&
+            parsedStart >= 0 &&
+            parsedStart < fileItem.size &&
+            parsedEnd >= parsedStart) {
+          startOffset = parsedStart;
+          endExclusive = min(fileItem.size, parsedEnd + 1);
+          isRangeRequest = true;
+        } else {
+          request.response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+          request.response.headers.set(
+            HttpHeaders.contentRangeHeader,
+            'bytes */${fileItem.size}',
+          );
+          await request.response.close();
+          return;
+        }
+      }
+    }
+
+    final remainingLength = max(0, endExclusive - startOffset);
 
     final encodedFileName = Uri.encodeComponent(fileItem.name);
+    request.response.bufferOutput = false;
     request.response.headers.contentType = ContentType.binary;
+    request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
     request.response.headers.set(
       'Content-Disposition',
       'attachment; filename="$encodedFileName"; filename*=UTF-8\'\'$encodedFileName',
     );
+    if (isRangeRequest) {
+      request.response.statusCode = HttpStatus.partialContent;
+      request.response.headers.set(
+        HttpHeaders.contentRangeHeader,
+        'bytes $startOffset-${endExclusive - 1}/${fileItem.size}',
+      );
+    }
     request.response.contentLength = remainingLength;
 
     if (!ctx.isWebPeer && startOffset > 0) {
@@ -1713,9 +2881,8 @@ class TransferService extends ChangeNotifier {
     final rawStream = _openFileOrMemoryStream(
       fileItem,
       start: startOffset,
-      end: fileItem.size,
+      end: endExclusive,
     );
-    final coalesceBuffer = BytesBuilder(copy: false);
     final downloadStopwatch = Stopwatch()..start();
     int downloadBytes = 0;
     final trackedStream = rawStream.transform<List<int>>(
@@ -1725,10 +2892,7 @@ class TransferService extends ChangeNotifier {
             sink.addError(const SocketException('用户已取消发送'));
             return;
           }
-          coalesceBuffer.add(chunk);
-          if (coalesceBuffer.length >= _sendChunkCoalesceBytes) {
-            sink.add(coalesceBuffer.takeBytes());
-          }
+          sink.add(chunk);
           downloadBytes += chunk.length;
           if (!ctx.isWebPeer) {
             ctx.session.transferredBytes = min(
@@ -1759,25 +2923,18 @@ class TransferService extends ChangeNotifier {
             );
           }
         },
-        handleDone: (sink) {
-          if (!_cancelledSessionIds.contains(sessionId) &&
-              coalesceBuffer.isNotEmpty) {
-            sink.add(coalesceBuffer.takeBytes());
-          } else {
-            coalesceBuffer.clear();
-          }
-          sink.close();
-        },
       ),
     );
 
     await request.response.addStream(trackedStream);
     await request.response.close();
 
-    ctx.completedFilesCount++;
-    if (ctx.completedFilesCount >= ctx.session.files.length &&
-        !ctx.completionCompleter.isCompleted) {
-      ctx.completionCompleter.complete();
+    if (endExclusive >= fileItem.size) {
+      ctx.completedFilesCount++;
+      if (ctx.completedFilesCount >= ctx.session.files.length &&
+          !ctx.completionCompleter.isCompleted) {
+        ctx.completionCompleter.complete();
+      }
     }
   }
 
@@ -1855,6 +3012,7 @@ class TransferService extends ChangeNotifier {
     }
 
     final client = HttpClient()
+      ..findProxy = null
       ..connectionTimeout = const Duration(seconds: 8)
       ..autoUncompress = false;
 
@@ -1938,7 +3096,6 @@ class TransferService extends ChangeNotifier {
         );
         final writeBuffer = BytesBuilder(copy: false);
         int bytesInFile = resumeOffset;
-        int unflushedBytes = 0;
 
         try {
           await for (final chunk in pullResp) {
@@ -1949,13 +3106,7 @@ class TransferService extends ChangeNotifier {
             bytesReceivedInRun += chunk.length;
             writeBuffer.add(chunk);
             if (writeBuffer.length >= _diskWriteBufferBytes) {
-              final bufferedLen = writeBuffer.length;
               sink.add(writeBuffer.takeBytes());
-              unflushedBytes += bufferedLen;
-              if (unflushedBytes >= _flushBackpressureBytes) {
-                unflushedBytes = 0;
-                await sink.flush();
-              }
             }
             session.transferredBytes += chunk.length;
 
@@ -2142,6 +3293,7 @@ class TransferService extends ChangeNotifier {
     };
 
     const seenOfferIds = new Set();
+    let isUploadingData = false;
 
     function formatBytes(bytes) {
       if (bytes < 1024) return bytes + ' B';
@@ -2151,6 +3303,7 @@ class TransferService extends ChangeNotifier {
     }
 
     async function pollHeartbeat() {
+      if (isUploadingData) return;
       try {
         const resp = await fetch('/api/register', {
           method: 'POST',
@@ -2242,14 +3395,14 @@ class TransferService extends ChangeNotifier {
       setTimeout(() => { btn.innerText = old; }, 1500);
     }
 
-    function uploadSingleFileWithProgress(url, token, file, onProgress) {
+    function uploadSliceBlob(url, blob, onProgress) {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', url, true);
-        xhr.setRequestHeader('X-Upload-Token', token);
+        // 不附加自定义请求头，使 POST text/plain Blob 成为 CORS 简单请求（零 OPTIONS 预检 RTT 开销）
         xhr.upload.onprogress = (ev) => {
           if (ev.lengthComputable && onProgress) {
-            onProgress(ev.loaded, ev.total);
+            onProgress(ev.loaded);
           }
         };
         xhr.onload = () => {
@@ -2260,8 +3413,22 @@ class TransferService extends ChangeNotifier {
           }
         };
         xhr.onerror = () => reject(new Error('网络中断'));
-        xhr.send(file);
+        xhr.send(blob);
       });
+    }
+
+    async function uploadSliceWithRetry(url, blob, onProgress) {
+      const maxAttempts = 4;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          if (onProgress) onProgress(0);
+          await uploadSliceBlob(url, blob, onProgress);
+          return;
+        } catch (err) {
+          if (attempt >= maxAttempts) throw err;
+          await new Promise(r => setTimeout(r, 400 * attempt));
+        }
+      }
     }
 
     async function sendNow() {
@@ -2288,30 +3455,108 @@ class TransferService extends ChangeNotifier {
           })
         });
         if (!prepResp.ok) { status.innerText = '对方拒绝了请求'; return; }
-        const { sessionId, token } = await prepResp.json();
+        const prepData = await prepResp.json();
+        const sessionId = prepData.sessionId;
+        const token = prepData.token;
+        const dataPort = prepData.dataPort || 0;
+        const resumeOffsets = prepData.resumeOffsets || {};
+
         const totalBytes = Array.from(files).reduce((acc, f) => acc + f.size, 0);
-        let completedBytes = 0;
-        const startTime = Date.now();
+        let completedFileBytes = 0;
+
         if (files.length > 0) {
           pWrap.style.display = 'block';
           pBar.style.width = '0%';
+          isUploadingData = true;
         }
+
+        const startTime = Date.now();
+        let lastUiUpdateMs = 0;
+        let windowStartMs = startTime;
+        let windowStartBytes = 0;
+        let smoothedSpeed = 0;
+
+        function updateUiProgress(force, activeFileIdx, inFlightBytes, resumedTotal) {
+          const now = Date.now();
+          if (!force && now - lastUiUpdateMs < 150) return;
+          lastUiUpdateMs = now;
+          const currentTotal = Math.min(totalBytes, completedFileBytes + inFlightBytes);
+          const pct = totalBytes > 0 ? Math.min(100, Math.round((currentTotal * 100) / totalBytes)) : 100;
+
+          const winElapsed = now - windowStartMs;
+          if (winElapsed >= 400) {
+            const winBytes = Math.max(0, currentTotal - windowStartBytes);
+            const instSpeed = (winBytes * 1000) / winElapsed;
+            smoothedSpeed = smoothedSpeed <= 0 ? instSpeed : (smoothedSpeed * 0.35 + instSpeed * 0.65);
+            windowStartMs = now;
+            windowStartBytes = currentTotal;
+          } else if (smoothedSpeed <= 0) {
+            const totalElapsedSec = Math.max(0.1, (now - startTime) / 1000);
+            smoothedSpeed = Math.max(0, currentTotal - resumedTotal) / totalElapsedSec;
+          }
+
+          const speedStr = formatBytes(Math.round(smoothedSpeed)) + '/s';
+          pBar.style.width = pct + '%';
+          status.innerText = '高速上传中 (' + (activeFileIdx + 1) + '/' + files.length + ') ' + pct + '% · ' + speedStr;
+        }
+
+        const dataOrigin = (dataPort > 0 && location.hostname)
+          ? (location.protocol + '//' + location.hostname + ':' + dataPort)
+          : '';
+        let useFallbackOrigin = !dataOrigin;
+
+        let resumedTotal = 0;
         for (let i = 0; i < files.length; i++) {
           const f = files[i];
-          const url = '/api/upload?sessionId=' + encodeURIComponent(sessionId) +
-            '&fileId=' + i +
-            '&fileName=' + encodeURIComponent(f.name) +
-            '&token=' + encodeURIComponent(token);
-          await uploadSingleFileWithProgress(url, token, f, (loaded) => {
-            const currentTotal = completedBytes + loaded;
-            const pct = totalBytes > 0 ? Math.min(100, Math.round((currentTotal * 100) / totalBytes)) : 100;
-            const elapsedSec = Math.max(0.1, (Date.now() - startTime) / 1000);
-            const speed = formatBytes(Math.round(currentTotal / elapsedSec)) + '/s';
-            pBar.style.width = pct + '%';
-            status.innerText = '正在上传 (' + (i + 1) + '/' + files.length + ') ' + pct + '% · ' + speed;
-          });
-          completedBytes += f.size;
+          const fid = String(i);
+          const startOff = Math.min(f.size, Math.max(0, Number(resumeOffsets[fid] || 0)));
+          resumedTotal += startOff;
         }
+        windowStartBytes = resumedTotal;
+
+        const SLICE_BYTES = 64 * 1024 * 1024;
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i];
+          const fid = String(i);
+          const startOff = Math.min(f.size, Math.max(0, Number(resumeOffsets[fid] || 0)));
+          completedFileBytes += startOff;
+          if (f.size > 0 && startOff >= f.size) {
+            updateUiProgress(true, i, 0, resumedTotal);
+            continue;
+          }
+
+          let cursor = startOff;
+          do {
+            const sliceEnd = Math.min(f.size, cursor + SLICE_BYTES);
+            const sliceLen = Math.max(0, sliceEnd - cursor);
+            const query = '/api/upload?sessionId=' + encodeURIComponent(sessionId) +
+              '&fileId=' + encodeURIComponent(fid) +
+              '&fileName=' + encodeURIComponent(f.name) +
+              '&offset=' + cursor +
+              '&length=' + sliceLen +
+              '&token=' + encodeURIComponent(token);
+
+            const payload = f.slice(cursor, sliceEnd, 'text/plain');
+            const onProg = (loaded) => {
+              updateUiProgress(false, i, loaded, resumedTotal);
+            };
+            try {
+              const targetUrl = useFallbackOrigin ? query : (dataOrigin + query);
+              await uploadSliceWithRetry(targetUrl, payload, onProg);
+            } catch (err) {
+              if (!useFallbackOrigin) {
+                useFallbackOrigin = true;
+                await uploadSliceWithRetry(query, payload, onProg);
+              } else {
+                throw err;
+              }
+            }
+            completedFileBytes += sliceLen;
+            cursor = sliceEnd;
+            updateUiProgress(true, i, 0, resumedTotal);
+          } while (cursor < f.size);
+        }
+
         textEl.value = '';
         fileEl.value = '';
         pBar.style.width = '100%';
@@ -2321,6 +3566,7 @@ class TransferService extends ChangeNotifier {
         status.innerText = '发送失败: ' + (err.message || err);
         pWrap.style.display = 'none';
       } finally {
+        isUploadingData = false;
         sendBtn.disabled = false;
       }
     }
@@ -2341,10 +3587,33 @@ class TransferService extends ChangeNotifier {
 
   @override
   void dispose() {
+    for (final timer in _sessionRetryGraceTimers.values) {
+      timer.cancel();
+    }
+    _sessionRetryGraceTimers.clear();
     for (final c in _activeSendingClients.values) {
       c.close(force: true);
     }
     _activeSendingClients.clear();
+    for (final comp in _sessionCancelCompleters.values) {
+      if (!comp.isCompleted) comp.complete();
+    }
+    _sessionCancelCompleters.clear();
+    for (final isolates in _activeSendingIsolates.values) {
+      for (final iso in isolates) {
+        iso.kill(priority: Isolate.immediate);
+      }
+    }
+    _activeSendingIsolates.clear();
+    for (final sendPort in _dataIsolateSendPorts) {
+      sendPort.send({'cmd': 'shutdown'});
+    }
+    _dataIsolateSendPorts.clear();
+    for (final iso in _dataIsolates) {
+      iso.kill(priority: Isolate.immediate);
+    }
+    _dataIsolates.clear();
+    _dataEngineReceivePort?.close();
     _server?.close(force: true);
     super.dispose();
   }

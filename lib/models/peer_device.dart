@@ -14,6 +14,7 @@ class PeerDevice {
   final DeviceType deviceType;
   final String os;
   final String ip;
+  final List<String> addresses;
   final int transferPort;
   final DateTime lastSeen;
 
@@ -24,9 +25,27 @@ class PeerDevice {
     required this.deviceType,
     required this.os,
     required this.ip,
+    this.addresses = const [],
     required this.transferPort,
     required this.lastSeen,
   });
+
+  /// 返回按优先级排列的候选可达 IP 列表（主 IP 优先，其余多网卡地址随后）
+  List<String> get candidateIps {
+    final result = <String>[];
+    if (ip.isNotEmpty && ip != '0.0.0.0') {
+      result.add(ip);
+    }
+    for (final addr in addresses) {
+      final trimmed = addr.trim();
+      if (trimmed.isNotEmpty &&
+          trimmed != '0.0.0.0' &&
+          !result.contains(trimmed)) {
+        result.add(trimmed);
+      }
+    }
+    return result;
+  }
 
   /// 提取 IP 最后一段作为局域网短码（例如 192.168.1.105 -> #105）
   String get shortCode {
@@ -47,6 +66,7 @@ class PeerDevice {
     DeviceType? deviceType,
     String? os,
     String? ip,
+    List<String>? addresses,
     int? transferPort,
     DateTime? lastSeen,
   }) {
@@ -57,6 +77,7 @@ class PeerDevice {
       deviceType: deviceType ?? this.deviceType,
       os: os ?? this.os,
       ip: ip ?? this.ip,
+      addresses: addresses ?? this.addresses,
       transferPort: transferPort ?? this.transferPort,
       lastSeen: lastSeen ?? this.lastSeen,
     );
@@ -70,6 +91,7 @@ class PeerDevice {
       'deviceType': deviceType.name,
       'os': os,
       'ip': ip,
+      if (addresses.isNotEmpty) 'addresses': addresses,
       'transferPort': transferPort,
     };
   }
@@ -84,6 +106,12 @@ class PeerDevice {
     final effectiveIp = (rawIp != null && rawIp.isNotEmpty && rawIp != '0.0.0.0')
         ? rawIp
         : (fallbackIp ?? '127.0.0.1');
+    final rawAddresses = (json['addresses'] as List<dynamic>?)
+            ?.whereType<String>()
+            .map((e) => e.trim())
+            .where((e) => e.isNotEmpty && e != '0.0.0.0')
+            .toList() ??
+        const <String>[];
 
     return PeerDevice(
       id: json['id'] as String? ?? 'unknown',
@@ -92,6 +120,7 @@ class PeerDevice {
       deviceType: deviceType,
       os: json['os'] as String? ?? 'Unknown',
       ip: effectiveIp,
+      addresses: rawAddresses,
       transferPort: (json['transferPort'] as num?)?.toInt() ?? 53318,
       lastSeen: DateTime.now(),
     );
